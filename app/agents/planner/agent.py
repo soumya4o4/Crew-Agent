@@ -1,0 +1,234 @@
+"""Trip Planner agent: share a reel and get a trip. A link (Instagram, YouTube, TikTok), a video, a screenshot or just a few
+words ("Goa 3 din") tells it where you want to go; it reads the reel to find the place and what to do there, writes a day-by-day
+plan, and, for the cities we book, carries on into flights, then hotel, cab and events with the same details.
+
+Button ids: planner:plan / days / fix / book, rdays:<n>. State: ctx["plan"] (the Insight as a dict) and these steps:
+planner_wait (waiting for a reel), planner_busy (reading it), planner_review (shown what it found), planner_days, planner_done,
+planner_fix (the user corrects the place). Reading a video takes 20-30 seconds, longer than a WhatsApp webhook should be kept
+waiting, so it runs in the background: we answer at once and send the result when it is ready (background=False runs it inline).
+"""
+import asyncio
+import logging
+from dataclasses import asdict
+
+from app.agents.base import Agent, Session
+from app.agents.planner import media as M
+from app.agents.planner.analyzer import MAX_DAYS, Insight, format_itinerary
+from app.core.geo import maps_link
+from app.core.messages import buttons_msg, cta_msg, list_msg, text_msg
+from app.core.places import CITIES, city
+
+logger = logging.getLogger(__name__)
+ANALYZE_TIMEOUT_S, PLAN_TIMEOUT_S = 60, 30
+ACK = "🎬 Reel mil gayi! Dekh rahe hain, 20-30 second lagenge ⏳"
+SHARE_HELP = ("Instagram, YouTube ya TikTok reel ka *link* bhejo, ya reel ki *video* / *screenshot*. "
+              "Ya bas likho kahan jaana hai, jaise *Goa 3 din*.")
+MSG_NEED_MORE = ("Is link se mujhe reel ka caption nahi mil paya (Instagram aksar rok deta hai). 🙏 Reel ki *video* ya *screenshot* bhej do, "
+                 "ya bas likho kahan ka hai.")
+MSG_NOT_FOUND = "🤔 Is reel se jagah pakki samajh nahi aayi. Reel ka *screenshot* ya jagah ka naam bhej do, jaise *Munnar*."
+MSG_FAILED = "😕 Reel padhne mein dikkat aayi. Ek baar phir bhejo, ya jagah ka naam likh do."
+MSG_TOO_BIG = "😕 Ye video bahut bada hai (16 MB tak chalta hai). Chhoti screen recording, screenshot ya jagah ka naam bhej do."
+
+
+class PlannerAgent(Agent):
+    name = "planner"
+    title = "Trip Planner"
+    emoji = "🗺️"
+    menu_desc = "Share a reel, get a trip plan"
+    owns = frozenset({"planner", "rdays"})
+
+    def __init__(self, repo, brain, links=None, download=None, send=None, video_parts=None, background: bool = True):
+        self.repo = repo                       # CoreRepo (conversation state for the background result)
+        self.brain = brain                     # OpenAIPlanner (or a fake with the same methods)
+        self.links = links or M.LinkReader()
+        self._download = download              # async (media_id, max_bytes) -> (bytes, mime); default: WhatsApp
+        self._send = send                      # async (number, message); default: WhatsApp
+        self._video_parts = video_parts or M.video_to_parts
+        self.background = background
+        self._tasks: set[asyncio.Task] = set()
+
+    async def _db(self, fn, *args):
+        return await asyncio.to_thread(fn, *args)
+
+    def reset(self, s: Session) -> None:
+        s.ctx.pop("plan", None)
+
+    def expects_text(self, s: Session) -> bool:
+        return s.step in ("planner_wait", "planner_fix")
+
+    def expects_media(self, s: Session) -> bool:
+        return s.step in ("planner_wait", "planner_fix")
+
+    def claims(self, text: str) -> bool:
+        return M.find_reel_url(text) is not None
+
+    def accepts_media(self, media: dict) -> bool:
+        return media.get("kind") in ("video", "image")  # nothing else wants a video; a lone screenshot is most likely a reel
+
+    # ------------------------------------------------------------------ entry points
+    async def on_enter(self, s: Session) -> list[dict]:
+        self.reset(s)
+        s.ctx["agent"], s.step = "planner", "planner_wait"
+        return [text_msg(f"🗺️ *Trip Planner*\n{SHARE_HELP}\n\nMain jagah pehchan kar din-ba-din plan bana dete hain, aur flight, hotel, cab tak sab yahin book ho jaata hai.")]
+
+    async def start(self, s: Session, slots: dict) -> list[dict]:
+        """Free text like "plan a trip to Goa": a city we know skips the reel."""
+        code = slots.get("to")
+        if code not in CITIES:
+            return await self.on_enter(s)
+        s.ctx["agent"] = "planner"
+        return self._show(s, Insight(label=city(code), city_code=code, confidence="high"))
+
+    async def process(self, s: Session, text: str, reply_id: str | None) -> list[dict]:
+        s.ctx["agent"] = "planner"
+        if reply_id:
+            return await self._on_tap(s, reply_id)
+        text = text.strip()
+        if url := M.find_reel_url(text):
+            return await self._run(s, link=url, text=text.replace(url, " ").strip())
+        if text and s.step in ("planner_wait", "planner_fix"):
+            return await self._run(s, text=text, inline=True)  # a few words are quick to read: no background job
+        return await self.on_enter(s)
+
+    async def on_media(self, s: Session, media: dict, caption: str) -> list[dict]:
+        s.ctx["agent"] = "planner"
+        return await self._run(s, media=media, text=caption)
+
+    # ----------------------------------------------------------------- reading a reel
+    async def _run(self, s: Session, media: dict | None = None, link: str | None = None, text: str = "",
+                   inline: bool = False) -> list[dict]:
+        job = {"media": media, "link": link, "text": text}
+        if inline or not self.background:
+            insight, messages = await self._read(**job)
+            s.step = self._apply(s.ctx, insight)
+            return ([] if inline else [text_msg(ACK)]) + messages
+        s.step = "planner_busy"
+        task = asyncio.create_task(self._deliver(s.phone, job))
+        self._tasks.add(task)  # keep a reference so the task is not garbage collected mid-way
+        task.add_done_callback(self._tasks.discard)
+        return [text_msg(ACK)]
+
+    async def _deliver(self, phone: str, job: dict) -> None:
+        """Background: read the reel, save what we found to the conversation, and message the user."""
+        try:
+            insight, messages = await self._read(**job)
+        except Exception:
+            logger.exception("Reel job failed")
+            insight, messages = None, [text_msg(MSG_FAILED)]
+        convo = await self._db(self.repo.get_conversation, phone)
+        ctx = dict((convo or {}).get("context") or {})
+        step = self._apply(ctx, insight)
+        await self._db(self.repo.save_conversation, phone, step, ctx)
+        send = self._send
+        if send is None:
+            from app.services.whatsapp_service import WhatsAppService
+            send = WhatsAppService.send
+        for m in messages:
+            await send(phone.lstrip("+"), m)
+
+    @staticmethod
+    def _apply(ctx: dict, insight: Insight | None) -> str:
+        ctx["agent"] = "planner"
+        if insight is None:
+            return "planner_fix"
+        ctx["plan"] = asdict(insight)
+        return "planner_review"
+
+    async def _read(self, media: dict | None, link: str | None, text: str) -> tuple[Insight | None, list[dict]]:
+        """Frames + speech + caption -> what and where. Returns (insight, messages to send); insight is None when we need more."""
+        frames, transcript = [], ""
+        try:
+            if link:
+                meta = await self.links.read(link)
+                text = " ".join(x for x in (text, meta["title"], meta["description"]) if x)
+            if media:
+                video = media["kind"] == "video"
+                download = self._download
+                if download is None:
+                    from app.services.whatsapp_service import WhatsAppService
+                    download = WhatsAppService.download_media
+                data, _ = await download(media["id"], M.MAX_VIDEO_BYTES if video else M.MAX_IMAGE_BYTES)
+                if video:
+                    frames, audio = await self._video_parts(data)
+                    transcript = await self._transcribe(audio) if audio else ""
+                else:
+                    frames = [await asyncio.to_thread(M.shrink_image, data)]
+            if not (frames or transcript or text.strip()):
+                return None, [text_msg(MSG_NEED_MORE)]
+            insight = await asyncio.wait_for(self.brain.analyze(frames, transcript, text), ANALYZE_TIMEOUT_S)
+        except ValueError:  # WhatsAppService.download_media: file too large
+            return None, [text_msg(MSG_TOO_BIG)]
+        except Exception:
+            logger.exception("Could not read the reel")
+            return None, [text_msg(MSG_FAILED)]
+        if insight is None:
+            return None, [text_msg(MSG_NOT_FOUND)]
+        return insight, self._card(insight)
+
+    async def _transcribe(self, audio: bytes) -> str:
+        try:
+            return await self.brain.transcribe(audio)
+        except Exception:
+            logger.warning("Could not transcribe the reel's audio", exc_info=True)  # frames and caption still work
+            return ""
+
+    # --------------------------------------------------------------------- screens
+    def _show(self, s: Session, insight: Insight) -> list[dict]:
+        s.ctx["plan"], s.step = asdict(insight), "planner_review"
+        return self._card(insight)
+
+    @staticmethod
+    def _card(i: Insight) -> list[dict]:
+        lines = [f"🎬 *{i.label}*"]
+        if i.confidence == "low":
+            lines.append("🤔 Pakka nahi hai, par ye jagah lag rahi hai.")
+        if i.places:
+            lines.append("📍 " + " · ".join(i.places))
+        if i.activities:
+            lines.append("🎯 " + ", ".join(i.activities))
+        if i.season:
+            lines.append(f"🌤️ Best time: {i.season}")
+        if i.vibe:
+            lines.append(f"✨ {i.vibe}")
+        lines.append("\n✈️ Yahan ki flights, hotel, cab aur events hum book kar sakte hain." if i.city_code else
+                     "\nℹ️ Is jagah ki booking abhi hamare paas nahi, par plan bana dete hain.")
+        return [buttons_msg("\n".join(lines), [("planner:plan", "📋 Plan my trip"), ("planner:fix", "✏️ Wrong place?"), ("nav:menu", "🏠 Menu")])]
+
+    def _ask_days(self, s: Session) -> list[dict]:
+        s.step = "planner_days"
+        plan = s.ctx["plan"]
+        rows = [(f"rdays:{n}", f"{n} day" + ("" if n == 1 else "s"), "Suggested for this reel" if n == plan["days"] else "") for n in range(1, MAX_DAYS + 1)]
+        return [list_msg(f"📅 *{Insight(**plan).short}*: kitne din ka trip?", "Choose days", rows, "Trip length")]
+
+    async def _on_tap(self, s: Session, reply_id: str) -> list[dict]:
+        kind, _, val = reply_id.partition(":")
+        plan = s.ctx.get("plan")
+        if kind == "rdays" and plan and val.isdigit() and 1 <= int(val) <= MAX_DAYS:
+            return await self._make_plan(s, int(val))
+        if kind == "planner":
+            if val in ("plan", "days") and plan:
+                return self._ask_days(s)
+            if val == "fix":
+                s.step = "planner_fix"
+                return [text_msg("✏️ Kahan ka hai? Jagah ka naam likho (jaise *Munnar*), ya reel ka screenshot bhej do.")]
+            if val == "book" and plan and plan.get("city_code"):
+                s.ctx["queue"] = ["hotel", "cab", "events"]  # what the flight flow offers after the ticket
+                s.ctx["follow_up"] = {"agent": "flight", "slots": {"to": plan["city_code"]}}
+                return [text_msg("Chalo, pehle flights dekhte hain ✈️ Uske baad hotel, cab aur events bhi.")]
+        return await self.on_enter(s)
+
+    async def _make_plan(self, s: Session, days: int) -> list[dict]:
+        insight = Insight(**s.ctx["plan"])
+        try:
+            plan = await asyncio.wait_for(self.brain.itinerary(insight, days), PLAN_TIMEOUT_S)
+        except Exception:
+            logger.exception("Could not write the itinerary")
+            return [buttons_msg("😕 Plan banane mein dikkat aayi. Phir try karein?", [(f"rdays:{days}", "🔁 Try again"), ("nav:menu", "🏠 Menu")])]
+        s.ctx["plan"]["days"], s.step = days, "planner_done"
+        out = [text_msg(t) for t in format_itinerary(insight, plan)]
+        if insight.city_code:
+            return out + [buttons_msg("Pasand aaya? Flights, hotel, cab aur events yahin book ho jaate hain. 👇",
+                                      [("planner:book", "✈️ Book this trip"), ("planner:days", "🔁 Change days"), ("nav:menu", "🏠 Menu")])]
+        return out + [cta_msg(f"📍 {insight.short} ko Google Maps par dekho.", "🗺️ Open Maps", maps_link(query=insight.label)),
+                      buttons_msg(f"ℹ️ {insight.short} ki booking abhi hamare paas nahi, par plan aapke paas hai.",
+                                  [("planner:days", "🔁 Change days"), ("planner:fix", "✏️ Other place"), ("nav:menu", "🏠 Menu")])]

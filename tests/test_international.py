@@ -1,0 +1,154 @@
+"""International trips: passport question, visa advice, and the suggestions that follow a booking."""
+import asyncio
+import json
+import uuid
+from datetime import timedelta
+
+from app.agents.base import Session
+from app.agents.concierge.classifiers import Intent
+from app.agents.concierge.slots import extract_slots
+from app.agents.flight.formatting import suggest_steps
+from app.core import places
+from app.core.utils import now_ist
+from app.services.travel_advisor import TravelAdvisor, VisaAdvice, parse_visa_advice
+from fakes import Chat, FakeRepo
+
+
+class FakeAdvisor:
+    def __init__(self, advice=None, tip="Try the dosa 🥞"):
+        self.advice, self.tip, self.calls = advice, tip, []
+
+    async def visa_check(self, citizenship, country):
+        self.calls.append((citizenship, country))
+        return self.advice
+
+    async def city_tip(self, city, country=""):
+        return self.tip
+
+
+def add_dubai_flight(repo):
+    dep = (now_ist() + timedelta(days=2)).replace(hour=9, minute=0, second=0, microsecond=0)
+    fid = str(uuid.uuid4())
+    repo.flights[fid] = {"id": fid, "airline": "Emirates", "flight_no": "EK-501", "from_code": "BOM", "to_code": "DXB",
+                         "departure_time": dep.isoformat(), "arrival_time": (dep + timedelta(hours=3)).isoformat(),
+                         "duration_min": 180, "price_inr": 15000, "class": "Economy", "seats_left": 5, "baggage_kg": 25,
+                         "stops": 0, "refundable": True, "status": "scheduled"}
+    return fid
+
+
+def open_dubai_flight(c, fid):
+    c.send("hi"); c.send(reply_id="svc:flight")
+    return c.send(reply_id=f"flt:{fid}")
+
+
+def test_a_domestic_flight_never_asks_for_a_passport():
+    c = Chat(advisor=FakeAdvisor())
+    c.enter_flights(); c.pick_flight()
+    assert c.send(reply_id="cfm:yes")["type"] == "text"
+    assert c.last[1]["buttons"][0][0] == "svc:hotel" and c.last[1]["buttons"][1][0] == "svc:cab"
+    assert "Try the dosa" in c.last[1]["body"] and "Heads up" not in c.last[1]["body"]
+
+
+def test_international_flight_asks_the_passport_then_shows_visa_advice():
+    repo = FakeRepo()
+    fid = add_dubai_flight(repo)
+    advisor = FakeAdvisor(VisaAdvice("e_visa", "Apply online for a tourist e-visa.", 30))
+    c = Chat(repo, advisor=advisor)
+    ask = open_dubai_flight(c, fid)
+    assert ask["type"] == "buttons" and "passport" in ask["body"] and [i for i, _ in ask["buttons"]] == ["cz:home", "cz:other"]
+    card = c.send(reply_id="cz:home")                                     # Mumbai flight: home country is India
+    assert advisor.calls == [("India", "United Arab Emirates")]
+    assert "e-Visa needed" in card["body"] and "Apply online" in card["body"] and "act:book" in c.ids()
+    assert "svc:visa" in c.ids()                                           # Indian passport + visa needed: offer our visa desk
+
+
+def test_other_passport_is_typed_and_remembered():
+    repo = FakeRepo()
+    fid = add_dubai_flight(repo)
+    advisor = FakeAdvisor(VisaAdvice("not_required", "Visa-free for 30 days.", 30))
+    c = Chat(repo, advisor=advisor)
+    open_dubai_flight(c, fid)
+    assert "Type your passport country" in c.send(reply_id="cz:other")["body"]
+    card = c.send("nepal")
+    assert advisor.calls == [("Nepal", "United Arab Emirates")] and "No visa needed" in card["body"]
+    assert "svc:visa" not in c.ids()                                       # nothing to apply for
+    c.send(reply_id="nav:menu"); c.send(reply_id="svc:flight")
+    assert c.send(reply_id=f"flt:{fid}")["type"] == "buttons" and len(advisor.calls) == 2  # not asked again
+
+
+def test_foreign_passport_gets_advice_but_no_visa_desk():
+    repo = FakeRepo()
+    fid = add_dubai_flight(repo)
+    c = Chat(repo, advisor=FakeAdvisor(VisaAdvice("required", "Apply at the embassy.", None)))
+    open_dubai_flight(c, fid)
+    c.send(reply_id="cz:other")
+    card = c.send("Pakistan")
+    assert "Indian passports for now" in card["body"] and "svc:visa" not in c.ids()
+
+
+def test_without_an_advisor_it_still_warns_and_points_to_the_visa_desk():
+    repo = FakeRepo()
+    fid = add_dubai_flight(repo)
+    c = Chat(repo)
+    open_dubai_flight(c, fid)
+    card = c.send(reply_id="cz:home")
+    assert "may need a visa" in card["body"] and "svc:visa" in c.ids()
+
+
+def test_international_booking_leads_with_the_visa_then_stay_and_forex():
+    repo = FakeRepo()
+    fid = add_dubai_flight(repo)
+    c = Chat(repo, advisor=FakeAdvisor(VisaAdvice("e_visa", "Apply online.", 30)))
+    open_dubai_flight(c, fid)
+    c.send(reply_id="cz:home"); c.send(reply_id="act:book"); c.send(reply_id="pax:1"); c.send(reply_id="name:self")
+    c.send(reply_id="cfm:yes")
+    follow = c.last[1]
+    assert [i for i, _ in follow["buttons"]] == ["svc:visa", "svc:hotel", "act:return"]
+    assert "Heads up" in follow["body"] and "currency" in follow["body"]
+    out = c.send(reply_id="svc:visa")
+    assert c.ids() == ["vpur:tourist", "vpur:business"] and "UAE" in out["body"]  # it already knows where they are going
+
+
+def test_suggestions_follow_the_trip():
+    domestic = {"intl": False, "city": "Goa"}
+    assert suggest_steps(domestic)[:2] == ["hotel", "cab"]
+    abroad = {"intl": True, "city": "Paris"}
+    assert suggest_steps(abroad, visa={"needs": False})[:3] == ["hotel", "forex", "cab"]
+    assert suggest_steps(abroad, visa={"needs": True})[0] == "visa"
+    assert suggest_steps(abroad, visa=None)[0] == "visa"                   # unknown counts as worth checking
+    assert suggest_steps(domestic, queue=["events"])[0] == "events" and "cab" not in suggest_steps(domestic, done=("cab",))
+
+
+def test_cities_come_from_the_registry_not_the_code():
+    places.load_airports([{"code": "CDG", "city": "Paris", "name": "Charles de Gaulle", "country": "France", "lat": 49.0, "lon": 2.55}])
+    assert places.city("CDG") == "Paris" and places.is_international("BOM", "CDG")
+    assert extract_slots("flight from mumbai to paris tomorrow", now_ist().date())["to"] == "CDG"
+    assert places.visa_code_for("United Arab Emirates") == "AE"
+
+
+def test_unknown_destination_gets_an_honest_answer():
+    c = Chat()
+    c.send("hi")
+    s = Session("+919876543210", {"id": "u"}, "menu", "m1", {})
+    out = asyncio.run(c.concierge._apply(s, Intent("flight", {"unknown_to": "Narnia"})))
+    assert "can't book travel to *Narnia*" in out[0]["body"] and ("nav:menu", "🏠 Menu") in out[0]["buttons"]
+
+
+def test_visa_answer_is_validated():
+    ok = parse_visa_advice(json.dumps({"status": "e_visa", "summary": "Apply <b>online</b>", "max_stay_days": 30}))
+    assert ok.status == "e_visa" and ok.summary == "Apply (b)online(/b)" and ok.max_stay_days == 30 and ok.needs_visa
+    assert parse_visa_advice(json.dumps({"status": "maybe", "summary": "x"})) is None
+    assert parse_visa_advice("not json") is None
+    assert parse_visa_advice(json.dumps({"status": "required", "summary": "x", "max_stay_days": 9999})).max_stay_days is None
+
+
+def test_advisor_survives_a_failing_model():
+    class Down:
+        class chat:
+            class completions:
+                @staticmethod
+                async def create(**kw):
+                    raise RuntimeError("down")
+
+    advisor = TravelAdvisor(Down, "m")
+    assert asyncio.run(advisor.visa_check("India", "Japan")) is None and asyncio.run(advisor.city_tip("Tokyo")) is None
