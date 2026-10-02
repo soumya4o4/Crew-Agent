@@ -7,6 +7,7 @@ class TripPlannerAgent(ComingSoonAgent):
     title = "Trip Planner"
     emoji = "🗺️"
     owns = frozenset({"planner"})
+    in_menu = False  # the Trip Guide offers it
     blurb = "Soon I'll build day-by-day itineraries and tie flights, stays and cabs into one plan."
 
     def trip_hint(self, trip: dict) -> str:

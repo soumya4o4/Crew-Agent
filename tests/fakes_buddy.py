@@ -37,6 +37,16 @@ class FakeBuddyRepo:
     def current_stay(self, user_id):
         return self.stay
 
+    stays = None  # a list of hotel bookings for user_stays; defaults to the single `stay`
+
+    def user_stays(self, user_id, limit=3):
+        return self.stays if self.stays is not None else ([self.stay] if self.stay else [])
+
+    paid = None  # a list of {amount_inr, kind, paid_at} for paid_payments
+
+    def paid_payments(self, user_id, limit=40):
+        return (self.paid or [])[:limit]
+
     def forget_user(self, user_id):
         self.memories = [m for m in self.memories if m["user_id"] != user_id]
         self.core.messages = [m for m in self.core.messages if m[0] != user_id]

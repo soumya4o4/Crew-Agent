@@ -11,6 +11,8 @@ from app.agents.planner import PlannerAgent
 from app.agents.concierge.router import IntentRouter
 from app.agents.flight import FlightAgent
 from app.agents.forex import ForexAgent
+from app.agents.guide import GuideAgent, GuideRepo
+from fakes_forex import FakeForexRepo, FakeRates
 from app.agents.hotel import HotelAgent
 from app.agents.planner import TripPlannerAgent
 from app.agents.visa import VisaAgent
@@ -69,6 +71,12 @@ class FakeRepo:
     # --- flight
     def list_airports(self):
         return self.airports
+
+    def origins_for(self, to_code):
+        return sorted({f["from_code"] for f in self.flights.values() if f["to_code"] == to_code and f["seats_left"] > 0})
+
+    def destinations_from(self, from_code):
+        return sorted({f["to_code"] for f in self.flights.values() if f["from_code"] == from_code and f["seats_left"] > 0})
 
     def popular_routes(self, limit=6):
         counts = {}
@@ -226,31 +234,35 @@ class FakeGateway:
 
 
 def build_concierge(repo, router=None, gateway=None, visa_agent=None, hotel_agent=None, buddy_agent=None, geo=None, events_repo=None,
-                    planner_agent=None, advisor=None):
-    agents = [FlightAgent(repo, gateway, advisor), hotel_agent or HotelAgent(FakeHotelRepo(repo), gateway), CabAgent(repo),
+                    planner_agent=None, advisor=None, forex_agent=None, guide_agent=None):
+    agents = [guide_agent, FlightAgent(repo, gateway, advisor), hotel_agent or HotelAgent(FakeHotelRepo(repo), gateway), CabAgent(repo),
               NearbyAgent(geo or FakeGeo()), planner_agent or TripPlannerAgent(repo), EventsAgent(events_repo or FakeEventsRepo()),
-              visa_agent or VisaAgent(FakeVisaRepo(repo), gateway, None, fake_fetch_media), ForexAgent(repo)]
+              visa_agent or VisaAgent(FakeVisaRepo(repo), gateway, None, fake_fetch_media), forex_agent or ForexAgent(FakeForexRepo(repo), gateway, FakeRates())]
     if buddy_agent:  # like the real app, Buddy only exists when there is an LLM for it
         agents.append(buddy_agent)
-    return Concierge(repo, agents, router or IntentRouter())
+    return Concierge(repo, [a for a in agents if a], router or IntentRouter())
 
 
 class Chat:
     """Simulates one WhatsApp user talking to the Concierge, and checks WhatsApp's size limits."""
 
-    def __init__(self, repo=None, router=None, gateway=None, brain=None, planner=False, advisor=None):
+    def __init__(self, repo=None, router=None, gateway=None, brain=None, planner=False, advisor=None, rates=None, guide_advisor=None):
         self.repo = repo or FakeRepo()
         self.visa_repo, self.verifier = FakeVisaRepo(self.repo), FakeVerifier()
         visa = VisaAgent(self.visa_repo, gateway, self.verifier, fake_fetch_media)
         self.hotel_repo = FakeHotelRepo(self.repo)
+        self.forex_repo, self.rates = FakeForexRepo(self.repo), rates or FakeRates()
+        forex = ForexAgent(self.forex_repo, gateway, self.rates)
+        self.guide_repo = GuideRepo(self.repo, self.hotel_repo, self.forex_repo, self.visa_repo, self.repo)
+        guide = GuideAgent(self.guide_repo, guide_advisor if guide_advisor is not None else advisor)
         hotel = HotelAgent(self.hotel_repo, gateway)
         self.buddy_repo, self.geo, self.events_repo = FakeBuddyRepo(self.repo), FakeGeo(), FakeEventsRepo()
-        buddy = BuddyAgent(self.buddy_repo, brain, self.geo) if brain else None
+        buddy = BuddyAgent(self.buddy_repo, brain, self.geo, self.hotel_repo) if brain else None
         self.planner_brain, self.media = (FakePlannerBrain(), FakeMedia()) if planner else (None, None)
         planner_agent = (PlannerAgent(self.repo, self.planner_brain, self.media, self.media.download, self.media.send, self.media.video_parts,
                                       background=False) if planner else None)
         self.concierge, self.n, self.last = build_concierge(self.repo, router, gateway, visa, hotel, buddy, self.geo, self.events_repo,
-                                                            planner_agent, advisor), 0, []
+                                                            planner_agent, advisor, forex, guide), 0, []
 
     def send(self, text="", reply_id=None):
         self.n += 1

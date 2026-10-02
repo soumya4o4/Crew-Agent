@@ -36,7 +36,7 @@ def test_a_question_about_the_booked_flight_stays_with_buddy_and_gets_the_trip_f
 def test_a_clear_booking_request_still_leaves_buddy():
     c, brain = booked_chat()
     c.send("book a flight from indore to goa tomorrow")
-    assert brain.calls == [] and c.ids() == ["sort:cheap", "sort:fast", "sort:time"]
+    assert brain.calls == [] and "Goa" in c.last[-1]["body"]  # the flight flow answered (no Indore-Goa route in the fake)
 
 
 def test_no_trip_means_no_trip_facts():
@@ -149,3 +149,26 @@ def test_model_actions_are_validated():
     assert parse_reply(json.dumps({"reply": "x", "action": {"type": "delete_everything"}})).action == "none"
     assert parse_reply(json.dumps({"reply": "x", "action": "airport_route"})).action == "none"           # must be an object
     assert parse_reply(json.dumps({"reply": "x"})).action == "none"
+
+
+# ------------------------------------------------------------------------- spending
+def test_paid_transactions_reach_buddy_as_facts_and_unpaid_ones_do_not():
+    from datetime import timedelta
+    from app.core.utils import now_ist
+    brain = FakeBrain()
+    c = Chat(brain=brain)
+    c.send("mera mood thoda off hai")
+    now = now_ist()
+    c.buddy_repo.paid = [{"amount_inr": 5200, "kind": "hotel", "paid_at": (now - timedelta(days=1)).isoformat()},
+                         {"amount_inr": 4100, "kind": "flight", "paid_at": (now - timedelta(days=9)).isoformat()}]
+    brain.calls.clear()
+    c.send("meri last transaction kitni thi?")
+    context = brain.calls[0]["context"]
+    assert "Last transaction: ₹5,200 for hotel" in context and "(flight)" in context and "total ₹9,300" in context
+
+
+def test_no_payments_says_so():
+    brain = FakeBrain()
+    c = Chat(brain=brain)
+    c.send("kitna spend hua?")
+    assert "no paid transactions yet" in brain.calls[0]["context"]

@@ -43,7 +43,17 @@ AIRPORTS = [
     ("GOI", "Goa", "Manohar International Airport", "India", 15.7441, 73.8644),
     ("AMD", "Ahmedabad", "Sardar Vallabhbhai Patel International Airport", "India", 23.0772, 72.6347),
     ("DXB", "Dubai", "Dubai International Airport", "United Arab Emirates", 25.2532, 55.3657),
+    ("JFK", "New York", "John F. Kennedy International Airport", "United States", 40.6413, -73.7781),
+    ("SFO", "San Francisco", "San Francisco International Airport", "United States", 37.6213, -122.379),
+    ("LHR", "London", "Heathrow Airport", "United Kingdom", 51.47, -0.4543),
+    ("CDG", "Paris", "Charles de Gaulle Airport", "France", 49.0097, 2.5479),
+    ("SIN", "Singapore", "Changi Airport", "Singapore", 1.3644, 103.9915),
+    ("BKK", "Bangkok", "Suvarnabhumi Airport", "Thailand", 13.69, 100.7501),
+    ("NRT", "Tokyo", "Narita International Airport", "Japan", 35.772, 140.3929),
+    ("SYD", "Sydney", "Sydney Kingsford Smith Airport", "Australia", -33.9399, 151.1753),
 ]
+COUNTRY = {a[0]: a[3] for a in AIRPORTS}
+NEW_AIRPORTS = {a[0] for a in AIRPORTS[11:]}  # the world cities: `--international-only` adds just these
 
 # (a, b, typical duration in minutes, base economy fare in INR). Each is generated both ways.
 ROUTES = [
@@ -61,7 +71,24 @@ ROUTES = [
     ("DEL", "CCU", 140, 5300),
     ("BLR", "MAA", 60, 3300),
     ("HYD", "BLR", 75, 3500),
-    ("BOM", "DXB", 195, 15500),  # the one international route
+    ("BOM", "DXB", 195, 15500),
+    # international (a, b, minutes, base fare in INR); the fare range scales with the base fare
+    ("DEL", "DXB", 205, 16500),
+    ("BOM", "JFK", 1000, 68000),
+    ("DEL", "JFK", 940, 62000),
+    ("DEL", "SFO", 960, 72000),
+    ("BOM", "LHR", 560, 50000),
+    ("DEL", "LHR", 540, 48000),
+    ("DEL", "CDG", 540, 52000),
+    ("BOM", "SIN", 330, 24000),
+    ("DEL", "SIN", 350, 26000),
+    ("BLR", "SIN", 270, 22000),
+    ("DEL", "BKK", 240, 17000),
+    ("BOM", "BKK", 270, 18000),
+    ("DEL", "NRT", 520, 55000),
+    ("DEL", "SYD", 720, 62000),
+    ("DXB", "JFK", 840, 52000),
+    ("DXB", "LHR", 450, 30000),
 ]
 
 # airline -> (code, digits in flight number, price multiplier, pick weight)
@@ -102,11 +129,11 @@ def pick_airline():
     return rng.choices(names, weights=[AIRLINES[n][3] for n in names])[0]
 
 
-def build_schedule():
+def build_schedule(routes=None):
     """A fixed daily timetable per directed route: 4-6 flights across the day."""
     used_numbers = set()
     schedule = []
-    for a, b, base_min, base_fare in ROUTES:
+    for a, b, base_min, base_fare in (routes or ROUTES):
         for src, dst in ((a, b), (b, a)):
             slots = list(SLOTS) + rng.sample(list(SLOTS), rng.randint(0, 2))
             for slot in slots:
@@ -129,7 +156,7 @@ def build_schedule():
                     duration = int(duration * 1.7) + 60  # layover + longer routing
                     fare_mult = 0.85
                 business = airline == "Air India" and rng.random() < 0.2
-                international = "DXB" in (src, dst)
+                international = COUNTRY[src] != COUNTRY[dst]
 
                 schedule.append({
                     "airline": airline, "flight_no": number,
@@ -148,18 +175,18 @@ def price_for(entry, days_ahead, dep_dt):
     advance = 1 + 0.30 * max(0, 10 - days_ahead) / 10  # up to +30% on the closest dates
     weekend = 1.05 if dep_dt.weekday() in (4, 6) else 1.0
     price = entry["base_fare"] * advance * weekend * rng.uniform(0.93, 1.07)
-    lo, hi = (12000, 25000) if entry["international"] else (3000, 9000)
+    lo, hi = (entry["base_fare"] * 0.7, entry["base_fare"] * 1.8) if entry["international"] else (3000, 9000)
     price = min(max(price, lo), hi)  # clamp the Economy fare, then apply the cabin multiplier
     if entry["class"] == "Business":
         price *= 2.2
     return int(round(price / 10) * 10)
 
 
-def build_flights():
+def build_flights(routes=None):
     now = datetime.now(IST)
     today = now.date()
     flights = []
-    for entry in build_schedule():
+    for entry in build_schedule(routes):
         for d in range(DAYS_AHEAD):
             dep = datetime.combine(today + timedelta(days=d), datetime.min.time(), IST) + timedelta(
                 minutes=entry["dep_min"])
@@ -398,6 +425,20 @@ def seed_visa_rules(client):
     print(f"  upserted {len(rows):>4} rows into visa_rules")
 
 
+def seed_international(client):
+    """Add the world cities and their routes without touching anything else (no bookings can point at them yet)."""
+    airports = [dict(zip(("code", "city", "name", "country", "lat", "lon"), a)) for a in AIRPORTS]
+    client.table("airports").upsert(airports).execute()
+    print(f"  upserted {len(airports):>4} rows into airports")
+    routes = [r for r in ROUTES if COUNTRY[r[0]] != COUNTRY[r[1]]]
+    for code in NEW_AIRPORTS:  # clear earlier runs of this command, then add fresh flights
+        client.table("flights").delete().eq("from_code", code).execute()
+        client.table("flights").delete().eq("to_code", code).execute()
+    # (BOM/DEL <-> DXB already exist from the full seed; skip routes that only touch old airports)
+    routes = [r for r in routes if r[0] in NEW_AIRPORTS or r[1] in NEW_AIRPORTS]
+    insert(client, "flights", build_flights(routes))
+
+
 def main():
     url, key = os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
@@ -405,6 +446,9 @@ def main():
     client = create_client(url, key)
 
     print("Seeding...")
+    if "--international-only" in sys.argv:
+        seed_international(client)
+        return print("Done.")
     if "--visa-only" in sys.argv:
         seed_visa_rules(client)
         return print("Done.")

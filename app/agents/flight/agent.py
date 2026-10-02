@@ -14,7 +14,9 @@ from datetime import date, datetime, timedelta
 from app.agents.base import Agent, Session
 from app.agents.flight.formatting import (NEXT_STEPS, PITCH, city_tip, countdown, flight_card, flight_row, flight_tags,
                                           suggest_steps)
-from app.core.messages import buttons_msg, cta_msg, list_msg, reaction_msg, text_msg
+from app.core.geo import fresh_location, haversine_m, nearest_city
+from app.core.places import AIRPORT_COORDS
+from app.core.messages import buttons_msg, cta_msg, list_msg, location_request_msg, reaction_msg, text_msg
 from app.core.places import CITIES, CITY_ALIASES, city, city_pattern, country_of, is_international, visa_code_for
 from app.core.utils import IST, day_greeting, dur, inr, now_ist, parse_date, to_ist
 
@@ -25,11 +27,14 @@ GREETINGS = {"hi", "hii", "hiii", "hello", "hey", "hlo", "namaste", "start", "ho
 THANKS = {"thanks", "thank you", "thx", "ty", "thanks!", "shukriya", "dhanyavad"}
 BYE = {"bye", "goodbye", "see you", "tata", "ok bye"}
 SORT_LABELS = {"cheap": "cheapest first", "fast": "fastest first", "time": "by departure time"}
+SORT_WORDS = {"cheapest": "cheap", "cheap": "cheap", "sasta": "cheap", "sabse sasta": "cheap", "fastest": "fast", "fast": "fast",
+              "jaldi": "fast", "quickest": "fast", "by time": "time", "time": "time", "earliest": "time"}
+ASKING_FOR_DATES = re.compile(r"\b(suggest|available|availability|which date|what date|kaun ?si|konsi|kab|when|options?|cheap\w*|sasta|dates?)\b")
 STATUS_ICON = {"confirmed": "✅", "pending": "⏳", "cancelled": "❌"}
-MENU_BUTTONS = [("menu:book", "✈️ Book a Flight"), ("menu:quick", "⚡ Quick Trips"), ("menu:bookings", "📋 My Bookings")]
+MENU_BUTTONS = [("menu:book", "🔍 Find flights"), ("menu:bookings", "🎫 My trips"), ("nav:menu", "🏠 Main menu")]
 TRIP_KEYS = ("from", "to", "date", "sort", "flight_id", "passenger_name", "flight_summary", "explore", "pre_to",
-             "pre_date", "pax", "names", "unit_price", "min_date", "await_flight", "visa_advice", "city_for")
-MAX_ROWS = 9  # a WhatsApp list holds 10 rows; the last one is "Another city…" when there are more places than fit
+             "pre_date", "pax", "names", "unit_price", "min_date", "await_flight", "visa_advice", "city_for", "await_place")
+MAX_ROWS = 8  # a WhatsApp list holds 10 rows; the last one is "Another city…" when there are more places than fit
 
 
 def is_home_passport(citizen: str) -> bool:
@@ -54,10 +59,29 @@ class FlightAgent(Agent):
             s.ctx.pop(k, None)
 
     def expects_text(self, s: Session) -> bool:
-        return s.step in ("awaiting_date", "awaiting_name", "awaiting_citizen", "awaiting_city")
+        return s.step in ("awaiting_date", "awaiting_name", "awaiting_citizen", "awaiting_city", "awaiting_flight")
+
+    def expects_location(self, s: Session) -> bool:
+        return s.step == "awaiting_origin_loc"
+
+    async def on_location(self, s: Session, loc: dict) -> list[dict]:
+        """A shared pin picks the departure airport: the closest one we know within 150 km."""
+        code = nearest_city(loc["lat"], loc["lon"], max_km=150)
+        if not code:
+            s.step = "awaiting_origin"
+            return [text_msg("📍 Thanks! I don't have an airport near you yet, so please pick a city from the list instead."),
+                    *await self._ask_origin(s)]
+        return await self._use_origin(s, code, f"📍 Your nearest airport is *{city(code)}*.")
+
+    async def _use_origin(self, s: Session, code: str, note: str = "") -> list[dict]:
+        out = await self._on_reply(s, f"from:{code}")
+        return ([text_msg(note)] if note else []) + out
 
     async def on_enter(self, s: Session) -> list[dict]:
-        return self._menu(s, note="✈️ *Flights*\nWhat would you like to do?")
+        """No menu to click through: straight to where they are flying from, with their last route one tap away."""
+        for k in TRIP_KEYS:
+            s.ctx.pop(k, None)
+        return await self._ask_origin(s, intro="✈️ *Flights*\n")
 
     async def start(self, s: Session, slots: dict) -> list[dict]:
         """Free text like "Indore to Goa tomorrow": pre-fill what we heard, ask only for the rest."""
@@ -102,6 +126,10 @@ class FlightAgent(Agent):
             return await self._on_citizen_text(s, text)
         if s.step == "awaiting_city":
             return await self._on_city_text(s, text)
+        if s.step == "awaiting_flight" and s.ctx.get("date") and not s.ctx.get("explore"):  # "cheapest", "fastest": re-sort the list
+            if low in SORT_WORDS:
+                s.ctx["sort"] = SORT_WORDS[low]
+            return await self._show_results(s)
         if low in ("change passport", "wrong passport", "passport change"):
             s.ctx.pop("citizen", None)
             return [text_msg("👍 Okay! I'll ask for your passport country again on your next international flight.")]
@@ -118,6 +146,13 @@ class FlightAgent(Agent):
         c = s.ctx
         if kind == "nav" or (kind == "menu" and val == "home"):
             return self._menu(s)
+        if kind == "from" and val == "loc":
+            if loc := fresh_location(c):
+                if code := nearest_city(loc["lat"], loc["lon"], max_km=150):
+                    return await self._use_origin(s, code, f"📍 Using your nearest airport: *{city(code)}*.")
+            s.step = "awaiting_origin_loc"
+            return [location_request_msg("📍 Share your location and I'll pick the airport closest to you. "
+                                         "I only use it for this, and forget it after a few hours.")]
         if kind in ("from", "to") and val == "more":
             c["city_for"], s.step = kind, "awaiting_city"
             return [text_msg("🏙️ Type the city you want, like *Paris* or *Pune*." if kind == "to"
@@ -148,23 +183,25 @@ class FlightAgent(Agent):
             return await self._advance(s)
         elif kind == "to" and c.get("from"):
             c["to"] = val
+            if val not in await self._db(self.repo.destinations_from, c["from"]):  # no flight runs this route at all
+                return await self._no_route(s)
             pre_date = c.pop("pre_date", None)
             if pre_date:
                 c["date"] = pre_date
-                return self._ask_sort(s)
+                return await self._show_results(s)
             return self._ask_date(s)
         elif kind == "date" and c.get("from") and (c.get("to") or c.get("explore")):
             if val == "more":
                 s.step = "awaiting_date"
                 return [text_msg("📅 Type the date, e.g. *15/10* or *15 Oct* (within the next 30 days).")]
             c["date"] = val
-            return await self._show_explore(s) if c.get("explore") else self._ask_sort(s)
+            return await self._show_explore(s) if c.get("explore") else await self._show_results(s)
         elif kind == "sort" and c.get("date"):
             c["sort"] = val
             return await self._show_results(s)
         elif kind == "flt":
             return await self._show_flight(s, val)
-        elif kind == "cz" and c.get("await_flight"):
+        elif kind == "cz" and (c.get("await_flight") or c.get("await_place")):
             return await self._on_citizen_tap(s, val)
         elif kind == "act" and val == "date" and c.get("from"):
             return self._ask_date(s)
@@ -229,13 +266,14 @@ class FlightAgent(Agent):
 
     # ------------------------------------------------------------- choosing cities
     @staticmethod
-    def _city_rows(kind: str, airports: list[dict], first_country: str, exclude: str | None = None) -> list[tuple[str, str, str]]:
+    def _city_rows(kind: str, airports: list[dict], first_country: str, exclude: str | None = None,
+                   limit: int = MAX_ROWS) -> list[tuple[str, str, str]]:
         """Airport rows for a list message, the traveller's own country first; the tail becomes "Another city…"."""
         pool = sorted((a for a in airports if a["code"] != exclude), key=lambda a: (a["country"] != first_country, a["country"], a["city"]))
         rows = [(f"{kind}:{a['code']}", a["city"], a["name"] if a["country"] == first_country else f"{a['country']} · {a['name']}")
                 for a in pool]
-        if len(rows) > MAX_ROWS + 1:
-            rows = rows[:MAX_ROWS] + [(f"{kind}:more", "Another city…", "Type the city name")]
+        if len(rows) > limit + 1:
+            rows = rows[:limit] + [(f"{kind}:more", "Another city…", "Type the city name")]
         return rows
 
     async def _home_country(self, s: Session, airports: list[dict]) -> str:
@@ -248,16 +286,24 @@ class FlightAgent(Agent):
             counts[a["country"]] = counts.get(a["country"], 0) + 1
         return max(counts, key=counts.get) if counts else ""
 
-    async def _ask_origin(self, s: Session) -> list[dict]:
+    async def _ask_origin(self, s: Session, intro: str = "") -> list[dict]:
         s.step = "awaiting_origin"
         airports = await self._db(self.repo.list_airports)
         home = await self._home_country(s, airports)
-        rows = self._city_rows("from", [a for a in airports if a["country"] == home] or airports, home)
-        if len(rows) < len(airports) and not any(r[0] == "from:more" for r in rows):  # flying from abroad: type the city
-            rows = rows[:MAX_ROWS] + [("from:more", "Another city…", "Type the city name")]
+        local = [a for a in airports if a["country"] == home] or airports
+        rows = [("from:loc", "📍 Use my location", "Nearest airport to you")]
+        last = None if s.ctx.get("explore") else await self._db(self.repo.list_user_bookings, s.user["id"], 1)
+        if last:
+            a, b = last[0]["flights"]["from_code"], last[0]["flights"]["to_code"]
+            rows.append((f"trip:{a}-{b}", f"🔁 {city(a)} → {city(b)}"[:24], "Repeat your last trip"))
+        limit = MAX_ROWS - (1 if last else 0)
+        city_rows = self._city_rows("from", local, home, limit=limit)
+        if len(local) < len(airports) and not any(r[0] == "from:more" for r in city_rows):  # flying from abroad: type the city
+            city_rows = city_rows[:limit] + [("from:more", "Another city…", "Type the city name")]
+        rows += city_rows
         body = ("🎲 *Surprise me!* Where are you flying from?\nI'll find the cheapest getaways."
                 if s.ctx.get("explore") else "🛫 *Where are you flying from?*")
-        return [list_msg(body, "Choose city", rows, "Departure city")]
+        return [list_msg(intro + body, "Choose city", rows, "Departure city")]
 
     async def _advance(self, s: Session) -> list[dict]:
         """Jump to the first step whose answer we don't have yet."""
@@ -268,13 +314,37 @@ class FlightAgent(Agent):
             return await self._ask_dest(s)
         if not c.get("date"):
             return self._ask_date(s)
-        return self._ask_sort(s)
+        return await self._show_results(s)
 
     async def _ask_dest(self, s: Session) -> list[dict]:
         s.step = "awaiting_dest"
         airports = await self._db(self.repo.list_airports)
-        rows = self._city_rows("to", airports, country_of(s.ctx["from"]), exclude=s.ctx["from"])
+        reachable = set(await self._db(self.repo.destinations_from, s.ctx["from"]))
+        if not reachable and len(airports) > 1:
+            return await self._no_departures(s, airports)
+        flyable = [a for a in airports if a["code"] in reachable] or airports
+        rows = self._city_rows("to", flyable, country_of(s.ctx["from"]), exclude=s.ctx["from"])
+        if len(flyable) < len(airports) - 1 and not any(r[0] == "to:more" for r in rows):  # others can be typed: we explain
+            rows = rows[:MAX_ROWS] + [("to:more", "Another city…", "Type the city name")]
         return [list_msg(f"🛬 *Where to from {city(s.ctx['from'])}?* 🌍", "Choose city", rows, "Destination")]
+
+    async def _no_departures(self, s: Session, airports: list[dict]) -> list[dict]:
+        """No flight leaves the chosen city at all: offer the nearest airports that have flights."""
+        frm = s.ctx["from"]
+        near = sorted((a["code"] for a in airports if a["code"] != frm), key=lambda o: self._km(frm, o) if self._km(frm, o) is not None else 10 ** 9)
+        rows = []
+        for o in near:
+            if len(rows) == 5:
+                break
+            if await self._db(self.repo.destinations_from, o):
+                km = self._km(frm, o)
+                rows.append((f"from:{o}", city(o), f"{km:,} km away" if km is not None else "Has flights"))
+        s.step = "awaiting_origin"
+        s.ctx.pop("from", None)
+        if not rows:
+            return await self._ask_origin(s)
+        return [list_msg(f"😕 I have no flights leaving *{city(frm)}* right now. These nearby airports do 👇",
+                         "Choose city", rows, "Nearest airports")]
 
     async def _on_city_text(self, s: Session, text: str) -> list[dict]:
         """"Another city…": the traveller typed a name. We can only fly where the airports table has an airport."""
@@ -284,7 +354,7 @@ class FlightAgent(Agent):
         if not code and (m := city_pattern().search(low)):
             code = CITY_ALIASES[m.group(1)]
         served = {a["code"] for a in await self._db(self.repo.list_airports)}
-        if not code or code not in served or (kind == "to" and code == s.ctx.get("from")):
+        if not code or (kind == "from" and code not in served) or (kind == "to" and code == s.ctx.get("from")):
             return [text_msg(f"😕 I can't book flights for *{text[:40]}* yet. Try another city, or type *menu*.")]
         s.ctx.pop("city_for", None)
         return await self._on_reply(s, f"{kind}:{code}")
@@ -312,16 +382,12 @@ class FlightAgent(Agent):
             return self._menu(s, greet=True)
         today = now_ist().date()
         d = parse_date(text, today)
+        if d is None and not s.ctx.get("explore") and ASKING_FOR_DATES.search(text.lower()):
+            return await self._suggest_dates(s)                    # "suggest me a date": show when flights actually run
         if d is None or d < today or d > today + timedelta(days=MAX_DAYS_AHEAD):
             return [text_msg("😕 I couldn't understand that date, or it's out of range. Please type a date within the next 30 days, e.g. *15/10* or *tomorrow*.")]
         s.ctx["date"] = d.isoformat()
-        return await self._show_explore(s) if s.ctx.get("explore") else self._ask_sort(s)
-
-    def _ask_sort(self, s: Session) -> list[dict]:
-        s.step = "awaiting_sort"
-        d = date.fromisoformat(s.ctx["date"])
-        return [buttons_msg(f"📅 {d:%A, %d %b}, nice choice!\nHow should I sort the flights?",
-                            [("sort:cheap", "💸 Cheapest"), ("sort:fast", "⚡ Fastest"), ("sort:time", "🕐 By time")])]
+        return await self._show_explore(s) if s.ctx.get("explore") else await self._show_results(s)
 
     # --------------------------------------------------------------- quick trips / explore
     async def _quick_trips(self, s: Session) -> list[dict]:
@@ -385,16 +451,7 @@ class FlightAgent(Agent):
         flights = await self._db(self.repo.search_flights, c["from"], c["to"], start, start + timedelta(days=1))
         flights = [f for f in flights if to_ist(f["departure_time"]) > now_ist()]
         if not flights:
-            s.step = "awaiting_date"
-            later = await self._db(self.repo.search_flights, c["from"], c["to"], start + timedelta(days=1), start + timedelta(days=8))
-            nxt = min(later, key=lambda f: f["departure_time"]) if later else None
-            msg = f"😕 No flights for {city(c['from'])} ➜ {city(c['to'])} on {d:%a, %d %b}."
-            if not nxt:
-                return [buttons_msg(msg + " Try another day?", [("act:date", "📅 Other date"), ("menu:book", "🔄 New route"), ("nav:menu", "🏠 Menu")])]
-            nd = to_ist(nxt["departure_time"]).date()
-            cheapest_next = min(f["price_inr"] for f in later if to_ist(f["departure_time"]).date() == nd)
-            return [buttons_msg(f"{msg}\n\n💡 Next available: *{nd:%a, %d %b}* from {inr(cheapest_next)}.",
-                                [(f"date:{nd.isoformat()}", f"📅 {nd:%a %d %b}"), ("act:date", "📅 Other date"), ("nav:menu", "🏠 Menu")])]
+            return await self._suggest_dates(s, f"😕 No flights for {city(c['from'])} ➜ {city(c['to'])} on {d:%a, %d %b}.")
 
         tags = flight_tags(flights)
         key = {"cheap": lambda f: (f["price_inr"], f["departure_time"]),
@@ -409,8 +466,81 @@ class FlightAgent(Agent):
         tip = await self._cheaper_nearby(c, d, cheapest)
         return [list_msg(
             f"✈️ *{city(c['from'])} ➜ {city(c['to'])}* · {d:%a, %d %b}\n"
-            f"Found *{len(flights)}* flights{extra}, from just *{inr(cheapest)}*, {SORT_LABELS[c.get('sort', 'time')]}.{tip}\nPick your favourite 👇",
+            f"Found *{len(flights)}* flights{extra}, from just *{inr(cheapest)}*, {SORT_LABELS[c.get('sort', 'time')]}.{tip}\nPick one 👇, or type *cheapest* / *fastest* to re-sort.",
             "View flights", rows, "Available flights")]
+
+    async def _suggest_dates(self, s: Session, header: str = "") -> list[dict]:
+        """The days in the next month this route has flights, with the cheapest fare each day. No flights at all on this
+        route: say which other cities fly there instead of leaving them stuck."""
+        c = s.ctx
+        today = now_ist().date()
+        start = datetime.combine(today, datetime.min.time(), IST)
+        flights = [f for f in await self._db(self.repo.search_flights, c["from"], c["to"], start, start + timedelta(days=MAX_DAYS_AHEAD + 1))
+                   if to_ist(f["departure_time"]) > now_ist()]
+        if not flights:
+            return await self._no_route(s)
+        by_day: dict[date, list[dict]] = {}
+        for f in flights:
+            by_day.setdefault(to_ist(f["departure_time"]).date(), []).append(f)
+        days = sorted(by_day)[:MAX_ROWS]
+        cheapest_day = min(by_day, key=lambda d: min(f["price_inr"] for f in by_day[d]))
+        rows = []
+        for day in days:
+            fares = [f["price_inr"] for f in by_day[day]]
+            tag = " · 💸 cheapest" if day == cheapest_day else ""
+            rows.append((f"date:{day.isoformat()}", f"{day:%a, %d %b}", f"from {inr(min(fares))} · {len(fares)} flight{'s' if len(fares) > 1 else ''}{tag}"))
+        rows.append(("date:more", "Another date…", "Type a date yourself"))
+        s.step = "awaiting_date"
+        lead = f"{header}\n\n" if header else ""
+        return [list_msg(f"{lead}📅 *{city(c['from'])} ➜ {city(c['to'])}* has flights on these days. Pick one 👇",
+                         "Choose date", rows, "Available dates")]
+
+    @staticmethod
+    def _km(a: str, b: str) -> int | None:
+        if a in AIRPORT_COORDS and b in AIRPORT_COORDS:
+            return round(haversine_m(*AIRPORT_COORDS[a], *AIRPORT_COORDS[b]) / 1000)
+        return None
+
+    async def _from_fare(self, frm: str, to: str) -> int | None:
+        """The cheapest fare on a route in the coming month, to show next to a suggested city."""
+        start = datetime.combine(now_ist().date(), datetime.min.time(), IST)
+        found = [f["price_inr"] for f in await self._db(self.repo.search_flights, frm, to, start, start + timedelta(days=MAX_DAYS_AHEAD + 1))
+                 if to_ist(f["departure_time"]) > now_ist()]
+        return min(found) if found else None
+
+    async def _no_route(self, s: Session) -> list[dict]:
+        """Nothing flies this route. First choice: the nearest cities that DO fly to the destination (with distance and fare).
+        If nothing flies there at all: nearby places we can fly to from here. Else say so plainly."""
+        c = s.ctx
+        frm, to = c["from"], c["to"]
+        c.pop("date", None)
+        origins = [o for o in await self._db(self.repo.origins_for, to) if o != frm]
+        origins.sort(key=lambda o: self._km(frm, o) if self._km(frm, o) is not None else 10 ** 9)
+        if origins:
+            c["pre_to"] = to
+            c.pop("to", None)
+            s.step = "awaiting_origin"
+            rows = []
+            for i, o in enumerate(origins[:MAX_ROWS]):
+                km = self._km(frm, o)
+                fare = await self._from_fare(o, to) if i < 4 else None
+                bits = [f"{km:,} km away" if km is not None else "", f"from {inr(fare)}" if fare else ""]
+                rows.append((f"from:{o}", city(o), " · ".join(b for b in bits if b) or f"Flies to {city(to)}"))
+            nearest = city(origins[0])
+            return [list_msg(f"😕 There are no direct flights from *{city(frm)}* to *{city(to)}*.\n\n"
+                             f"✈️ But these cities do fly there, and *{nearest}* is the nearest to you. Pick where to start from, "
+                             "and I'll find the dates 👇", "Choose city", rows, "Flies to " + city(to)[:14])]
+        reachable = [o for o in await self._db(self.repo.destinations_from, frm) if o != to]
+        close = sorted((o for o in reachable if (self._km(to, o) or 10 ** 9) <= 600), key=lambda o: self._km(to, o))
+        if close:
+            s.step = "awaiting_dest"
+            c.pop("to", None)
+            rows = [(f"to:{o}", city(o), f"{self._km(to, o):,} km from {city(to)}") for o in close[:MAX_ROWS]]
+            return [list_msg(f"😕 I can't fly to *{city(to)}* yet, but these places are close to it and I can book them from "
+                             f"{city(frm)} 👇", "Choose city", rows, "Near " + city(to)[:18])]
+        s.step = "menu"
+        return [buttons_msg(f"😕 I don't have flights to *{city(to)}* yet. Want to try another place?",
+                            [("menu:book", "🔍 New search"), ("nav:menu", "🏠 Main menu")])]
 
     async def _cheaper_nearby(self, c: dict, d: date, cheapest: int) -> str:
         """Tip when the day before or after is clearly cheaper (>= 7% less)."""
@@ -462,20 +592,60 @@ class FlightAgent(Agent):
 
     async def _on_citizen_tap(self, s: Session, val: str) -> list[dict]:
         c = s.ctx
-        f = await self._db(self.repo.get_flight, c["await_flight"])
-        if val == "home" and f:
-            c["citizen"] = country_of(f["from_code"])
-            return await self._show_flight(s, c.pop("await_flight"))
+        if val == "home":
+            f = await self._db(self.repo.get_flight, c["await_flight"]) if c.get("await_flight") else None
+            c["citizen"] = country_of(f["from_code"]) if f else await self._home_country(s, await self._db(self.repo.list_airports))
+            return await self._after_citizen(s)
         s.step = "awaiting_citizen"
         return [text_msg("✏️ Type your passport country, like *Nepal* or *United Kingdom*.")]
 
     async def _on_citizen_text(self, s: Session, text: str) -> list[dict]:
-        if not s.ctx.get("await_flight"):
+        if not (s.ctx.get("await_flight") or s.ctx.get("await_place")):
             return self._menu(s, greet=True)
         if not re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{1,39}", text):
             return [text_msg("😕 Please type just the country name, like *India* or *United States*.")]
         s.ctx["citizen"] = " ".join(text.split()).title()
-        return await self._show_flight(s, s.ctx.pop("await_flight"))
+        return await self._after_citizen(s)
+
+    async def _after_citizen(self, s: Session) -> list[dict]:
+        c = s.ctx
+        if c.get("await_flight"):
+            return await self._show_flight(s, c.pop("await_flight"))
+        return await self._idea_advice(s, c.pop("await_place"))
+
+    async def trip_idea(self, s: Session, place: str) -> list[dict]:
+        """They want to go somewhere we have no airport for. Do the part we can still do well: the entry rules for
+        their passport first (it can take weeks), then offer a plan and the visa desk."""
+        for k in TRIP_KEYS:
+            s.ctx.pop(k, None)
+        s.ctx["await_place"] = place
+        if s.ctx.get("citizen"):
+            return await self._after_citizen(s)
+        s.step = "awaiting_citizen"
+        home = await self._home_country(s, await self._db(self.repo.list_airports))
+        return [buttons_msg(f"✨ *{place[:40]}*, great choice! Before anything, entry rules depend on your passport.\n\n"
+                            "Which passport will you travel on? I'll check if you need a visa.",
+                            [("cz:home", f"🛂 {home}"[:20]), ("cz:other", "🌍 Other passport")])]
+
+    async def _idea_advice(self, s: Session, place: str) -> list[dict]:
+        c, citizen = s.ctx, s.ctx["citizen"]
+        found = await self.advisor.place_country(place) if self.advisor else None
+        name, country = found or (place, "")
+        advice = await self.advisor.visa_check(citizen, country) if self.advisor and country else None
+        lines = [f"🌍 *{name}*" + (f", {country}" if country else "")]
+        if advice:
+            lines += [f"{advice.icon} *{advice.headline}* · {citizen} passport → {country}", advice.summary]
+        else:
+            lines.append("🛂 Entry rules depend on your passport. Please check the official visa site before you book.")
+        lines.append("📘 Passport should be valid 6+ months after your trip. Rules change, so confirm with the embassy.")
+        lines.append(f"\n✈️ I can't book flights to {name} yet, but I can plan the trip and sort the visa for you.")
+        code = visa_code_for(country) if country else None
+        buttons = [("svc:planner", "🗺️ Plan My Trip"), ("nav:menu", "🏠 Menu")]
+        if code and is_home_passport(citizen) and (advice is None or advice.needs_visa):
+            c["pending_slots"] = {"country": code}
+            buttons.insert(0, ("svc:visa", "🛂 Visa help"))
+        s.step = "menu"
+        return [buttons_msg("\n".join(lines), buttons)]
 
     async def _travel_note(self, s: Session, f: dict):
         """The entry-rules paragraph for an international flight, and the advice behind it (None when we couldn't tell)."""

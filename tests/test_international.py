@@ -25,6 +25,9 @@ class FakeAdvisor:
     async def city_tip(self, city, country=""):
         return self.tip
 
+    async def place_country(self, place):
+        return {"new york": ("New York", "United States")}.get(place.lower())
+
 
 def add_dubai_flight(repo):
     dep = (now_ist() + timedelta(days=2)).replace(hour=9, minute=0, second=0, microsecond=0)
@@ -126,12 +129,27 @@ def test_cities_come_from_the_registry_not_the_code():
     assert places.visa_code_for("United Arab Emirates") == "AE"
 
 
-def test_unknown_destination_gets_an_honest_answer():
-    c = Chat()
+def test_a_trip_wish_to_a_place_we_cannot_book_asks_the_passport_then_gives_visa_advice():
+    advisor = FakeAdvisor(VisaAdvice("e_visa", "Apply for a B-2 visa at the US embassy.", 180))
+    c = Chat(advisor=advisor)
     c.send("hi")
-    s = Session("+919876543210", {"id": "u"}, "menu", "m1", {})
-    out = asyncio.run(c.concierge._apply(s, Intent("flight", {"unknown_to": "Narnia"})))
-    assert "can't book travel to *Narnia*" in out[0]["body"] and ("nav:menu", "🏠 Menu") in out[0]["buttons"]
+    s = Session("+919876543210", {"id": "u"}, "menu", "m1", c.repo.convos.get("+919876543210", {}).get("context", {}))
+    out = asyncio.run(c.concierge._apply(s, Intent("flight", {"unknown_to": "New York"})))
+    assert "passport" in out[0]["body"] and [i for i, _ in out[0]["buttons"]] == ["cz:home", "cz:other"]
+    c.concierge.repo.save_conversation("+919876543210", s.step, s.ctx)
+    card = c.send(reply_id="cz:home")
+    assert advisor.calls == [("India", "United States")]
+    assert "e-Visa needed" in card["body"] and "can't book flights to New York" in card["body"]
+    assert "svc:visa" in c.ids() and "svc:planner" in c.ids()
+
+
+def test_origin_can_be_picked_by_sharing_a_location():
+    c = Chat()
+    c.enter_flights()
+    c.send(reply_id="menu:book")
+    assert "location" in c.send(reply_id="from:loc")["body"].lower()
+    out = c.send_location(22.72, 75.86)                                    # Indore
+    assert "Indore" in c.last[0]["body"] and out is not None and c.ids()[0].startswith("to:")
 
 
 def test_visa_answer_is_validated():

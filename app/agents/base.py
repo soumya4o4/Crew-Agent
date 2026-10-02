@@ -26,6 +26,7 @@ class Agent:
     title: str = ""
     emoji: str = ""
     menu_desc: str = ""
+    in_menu: bool = True  # False: not a row in the main menu (still reachable by text, buttons and shared files)
     owns: frozenset[str] = frozenset()
 
     def reset(self, s: Session) -> None:

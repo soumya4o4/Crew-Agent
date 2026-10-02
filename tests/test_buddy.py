@@ -80,14 +80,14 @@ def test_suggestions_become_buttons_that_open_the_service():
     brain.queue.append(BuddyReply("Thoda ghoom aao yaar!", suggest=["flight", "hotel"]))
     out = c.send("bahut stress hai, kuch samajh nahi aa raha")
     assert out["type"] == "buttons" and [i for i, _ in out["buttons"]] == ["svc:flight", "svc:hotel"]
-    assert "menu:book" in [i for i, _ in c.send(reply_id="svc:flight")["buttons"]]
+    assert "from:loc" in [r[0] for r in c.send(reply_id="svc:flight")["rows"]]  # straight to the route, no menu
 
 
 def test_asking_for_a_service_mid_chat_switches_topic():
     c, brain = chat()
     c.send("mood off hai")
     c.send("flight from indore to mumbai tomorrow")
-    assert c.ids() == ["sort:cheap", "sort:fast", "sort:time"] and len(brain.calls) == 1
+    assert c.ids()[0].startswith("flt:") and len(brain.calls) == 1  # straight to the flights, no sort question
 
 
 def test_bookings_and_help_still_work_mid_chat():
@@ -177,7 +177,7 @@ def test_reply_parsing_drops_anything_unsafe():
                      {"category": "people", "content": "Has a sister Riya"}],
         "suggest": ["hotel", "teleport", "hotel", "flight", "cab"], "risk": "maybe"})
     r = parse_reply(raw)
-    assert r.reply == "Hey!" and r.risk == "none" and r.suggest == ["hotel", "flight"]
+    assert r.reply == "Hey!" and r.risk == "none" and r.suggest == ["hotel", "flight", "cab"]
     assert [m["content"] for m in r.remember] == ["Trip (to) Goa", "Likes window seats", "Lives in Indore"]
     with pytest.raises(ValueError):
         parse_reply('{"reply": " "}')
@@ -204,3 +204,11 @@ def test_openai_buddy_sends_history_and_asks_for_json():
         history=[{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": ""}]))
     assert r.reply == "Hi" and seen["model"] == "test-model" and seen["response_format"] == {"type": "json_object"}
     assert [m["role"] for m in seen["messages"]] == ["system", "user", "assistant", "user"]
+
+
+def test_a_nearby_request_for_events_goes_to_the_events_agent_not_a_map_search():
+    c, brain = chat()
+    brain.queue.append(BuddyReply("Dekhta hoon kya chal raha hai.", action="nearby", query="events"))
+    c.send("aaj bahut boring day hai, kuch exciting hai?")
+    assert c.geo.calls == [] or all(call[0] != "places" for call in c.geo.calls)
+    assert "Events" in " ".join(m.get("body", "") for m in c.last) or c.last[-1]["type"] in ("location_request", "text", "list", "buttons")

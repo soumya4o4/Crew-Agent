@@ -11,10 +11,12 @@ What Buddy remembers lives in `user_memories`; "forget me" deletes it together w
 import asyncio
 import logging
 import re
+from datetime import date
 
 from app.agents.base import Agent, Session
 from app.agents.buddy import trip as T
-from app.agents.buddy.brain import SERVICES
+from app.agents.buddy.brain import SERVICES, MAX_SUGGEST
+from app.agents.buddy.needs import next_needs
 from app.core import safety
 from app.core.geo import fresh_location, maps_link
 from app.core.messages import buttons_msg, cta_msg, location_request_msg, text_msg
@@ -32,6 +34,8 @@ FORGET = re.compile(r"\b(forget me|forget everything|delete (?:all )?my (?:data|
                     r"(?:delete|clear|hata)\w*|sab (?:kuch )?bhool ja\w*)\b")
 SHOW = re.compile(r"\b(what do you (?:remember|know) about me|kya yaad hai|mere baare mein kya (?:pata|yaad|jaante)|"
                   r"show my memor(?:y|ies))\b")
+# a "place" that is really something to attend: it belongs to the events agent, not a map search
+EVENTISH = re.compile(r"\b(events?|shows?|concerts?|festivals?|gigs?|things to do|activit\w*|exciting|fun|entertainment|happening)\b")
 # "book a flight to Goa" is a request for a service; "flight mein kitna time hai?" is a question for Buddy
 BOOKING_ASK = re.compile(r"\b(book|booking|search|find|dhundh\w*|dhoondh\w*|chahiye|i need|need a|want a|looking for|show me)\b")
 
@@ -43,10 +47,11 @@ class BuddyAgent(Agent):
     menu_desc = "Talk, vent, ask anything"
     owns = frozenset({"buddy"})
 
-    def __init__(self, repo, brain, geo=None):
-        self.repo = repo    # BuddyRepo
-        self.brain = brain  # OpenAIBuddy (or a fake with the same `respond`)
-        self.geo = geo      # GeoService: travel times and place names. None: Buddy works without them
+    def __init__(self, repo, brain, geo=None, hotels=None):
+        self.repo = repo      # BuddyRepo
+        self.brain = brain    # OpenAIBuddy (or a fake with the same `respond`)
+        self.geo = geo        # GeoService: travel times and place names. None: Buddy works without them
+        self.hotels = hotels  # HotelRepo (search_hotels): other stays to suggest. None: no suggestions from inventory
 
     async def _db(self, fn, *args):
         return await asyncio.to_thread(fn, *args)
@@ -117,7 +122,11 @@ class BuddyAgent(Agent):
     async def _trip(self, s: Session) -> T.TripInfo:
         """The facts about the booked trip and where the user is, computed here so the model never has to guess."""
         bookings = await self._safe(self.repo.upcoming_flights, s.user["id"]) or []
-        stay = await self._safe(self.repo.current_stay, s.user["id"])
+        stays = await self._safe(self.repo.user_stays, s.user["id"]) or []
+        stay = await self._safe(self.repo.current_stay, s.user["id"]) or (stays[0] if stays else None)
+        stays = stays or ([stay] if stay else [])
+        options = await self._stay_options(stays[:2])
+        payments = await self._safe(self.repo.paid_payments, s.user["id"]) or []
         loc = fresh_location(s.ctx)
         label = route = None
         if loc:
@@ -128,7 +137,26 @@ class BuddyAgent(Agent):
             nxt = T.pick_next_flight(bookings, now_ist())
             if nxt and self.geo and nxt["flights"]["from_code"] in AIRPORT_COORDS and T.to_ist(nxt["flights"]["departure_time"]) > now_ist():
                 route = await self.geo.route((loc["lat"], loc["lon"]), AIRPORT_COORDS[nxt["flights"]["from_code"]])
-        return T.describe(now_ist(), bookings, stay, loc, label, route)
+        return T.describe(now_ist(), bookings, stay, loc, label, route, stays, options, payments)
+
+    async def _stay_options(self, stays: list[dict]) -> dict:
+        """Other hotels with a free room in the same city on the same nights, so Buddy suggests real inventory only:
+        the two cheapest and the two best rated, never the one already booked."""
+        out: dict = {}
+        for st in stays:
+            try:
+                if not (self.hotels and st.get("hotels") and st.get("check_in") and st.get("check_out")):
+                    continue
+                found = await self._db(self.hotels.search_hotels, st["hotels"]["city_code"],
+                                       date.fromisoformat(str(st["check_in"])[:10]),
+                                       date.fromisoformat(str(st["check_out"])[:10]), st.get("guests") or 1)
+                found = [h for h in found if h["id"] != st["hotels"].get("id")]
+                cheap = sorted(found, key=lambda h: h["rooms"][0]["price_inr"])[:2]
+                best = sorted((h for h in found if h not in cheap), key=lambda h: -float(h.get("rating") or 0))[:2]
+                out[st.get("id") or st.get("ref")] = cheap + best
+            except Exception:
+                logger.warning("Could not look up other stays", exc_info=True)
+        return out
 
     # ------------------------------------------------------------------------ chat
     async def _chat(self, s: Session, text: str) -> list[dict]:
@@ -148,14 +176,27 @@ class BuddyAgent(Agent):
             reply += safety.RISK_NOTES[r.risk]
         if r.remember:
             await self._safe(self.repo.add_memories, s.user["id"], r.remember)
-        out = self._reply_messages(reply, r.suggest)
+        if "hotel" in r.suggest and trip.stay and trip.stay.get("hotels"):  # "other stays" opens the hotel search in that city
+            s.ctx["pending_slots"] = {"to": trip.stay["hotels"]["city_code"], "date": str(trip.stay["check_in"])[:10]}
+        out = self._reply_messages(reply, self._buttons(s, r, trip, text))
         return out + self._act(s, r, trip)
 
     @staticmethod
-    def _reply_messages(reply: str, suggest: list[str]) -> list[dict]:
-        if not suggest:
+    def _buttons(s: Session, r, trip: T.TripInfo, text: str) -> list[tuple[str, str]]:
+        """The next-step buttons: what the facts say they need (a flight tomorrow, no hotel yet...) first, then whatever the
+        model suggested. Nothing when they are upset, and nothing extra when we are already sending them somewhere."""
+        wanted = [(k, SERVICES[k]) for k in r.suggest if k in SERVICES]
+        if r.risk == "none" and r.action == "none":
+            for k, label in next_needs(now=now_ist(), text=text, flight=trip.flight, stay=trip.stay, trip=s.ctx.get("trip"),
+                                       has_location=bool(trip.loc)):
+                if all(k != w[0] for w in wanted):
+                    wanted.append((k, label))
+        return [(f"svc:{k}", label) for k, label in wanted[:MAX_SUGGEST]]
+
+    @staticmethod
+    def _reply_messages(reply: str, buttons: list[tuple[str, str]]) -> list[dict]:
+        if not buttons:
             return [text_msg(reply)]
-        buttons = [(f"svc:{k}", SERVICES[k]) for k in suggest]
         if len(reply) <= 1000:
             return [buttons_msg(reply, buttons)]
         return [text_msg(reply), buttons_msg("Chaho to ye bhi dekh sakte hain 👇", buttons)]
@@ -177,9 +218,9 @@ class BuddyAgent(Agent):
                             maps_link(query=f"{h['name']}, {h['area']}, {city(h['city_code'])}"))]
         if r.action == "ask_location" and not trip.loc:
             return self._ask_location(s, "ask_location", "Location share karo, phir sahi raasta aur timing nikaal sakte hain.")
-        if r.action == "nearby" and r.query:
+        if r.action == "nearby" and r.query and not EVENTISH.search(r.query.lower()):
             s.ctx["follow_up"] = {"agent": "nearby", "slots": {"place": r.query}}
-        elif r.action == "events":
+        elif r.action == "events" or (r.action == "nearby" and EVENTISH.search(r.query.lower())):  # "events" is not a place on a map
             s.ctx["follow_up"] = {"agent": "events", "slots": {}}
         return []
 

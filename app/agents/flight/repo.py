@@ -49,6 +49,18 @@ class FlightRepo(CoreRepo):
         rows = self.db.table("flights").select("from_code, to_code").neq("status", "cancelled").limit(1000).execute().data
         return [route for route, _ in Counter((r["from_code"], r["to_code"]) for r in rows).most_common(limit)]
 
+    def origins_for(self, to_code: str) -> list[str]:
+        """Airports that have a bookable flight to `to_code` from now on."""
+        rows = (self.db.table("flights").select("from_code").eq("to_code", to_code).neq("status", "cancelled")
+                .gt("seats_left", 0).gte("departure_time", _utc_str(datetime.now(timezone.utc))).limit(1000).execute().data)
+        return sorted({r["from_code"] for r in rows})
+
+    def destinations_from(self, from_code: str) -> list[str]:
+        """Airports reachable from `from_code` by a bookable flight from now on."""
+        rows = (self.db.table("flights").select("to_code").eq("from_code", from_code).neq("status", "cancelled")
+                .gt("seats_left", 0).gte("departure_time", _utc_str(datetime.now(timezone.utc))).limit(1000).execute().data)
+        return sorted({r["to_code"] for r in rows})
+
     def get_flight(self, flight_id: str) -> dict | None:
         rows = self.db.table("flights").select("*").eq("id", flight_id).limit(1).execute().data
         return rows[0] if rows else None

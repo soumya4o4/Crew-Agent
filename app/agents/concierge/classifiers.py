@@ -12,7 +12,7 @@ from datetime import date
 from app.agents.concierge.slots import extract_slots
 from app.core.places import CITIES, CITY_ALIASES, COUNTRY_ALIASES
 
-SERVICES = ("flight", "hotel", "cab", "nearby", "planner", "events", "visa", "forex")
+SERVICES = ("flight", "hotel", "cab", "nearby", "planner", "events", "visa", "forex", "guide")
 INTENTS = SERVICES + ("bookings", "help", "buddy", "smalltalk", "unknown")
 THANKS = {"thanks", "thank you", "thx", "ty", "shukriya", "dhanyavad"}
 BYE = {"bye", "goodbye", "see you", "tata", "ok bye"}
@@ -27,8 +27,13 @@ PATTERNS = {
     "planner": r"\b(reels?|itinerary|plan(?:ning)? (?:a |my |the )?(?:trip|holiday|vacation)|trip plan|holiday|vacation|getaway|things to do)\b",
     "events": r"\b(events?|concerts?|festivals?|matches|gigs?|shows?)\b",
     "nearby": r"\b(near ?by|near me|around me|aas ?paas|paas mein|nearest|closest|close by)\b",
+    # newcomer talk, but only when it is about travel ("kuch samajh nahi aa raha" alone is a mood, not a trip)
+    "guide": r"(?=.*\b(trip|travel\w*|abroad|videsh|vacation|holiday|ghoom\w*|tour|visa|flights?|international|yatra|safar)\b).*\b(first time|pehli ?baar|kuch (?:nahi|nahin) pata|nahi pata|nahin pata|guide me|help me plan|where (?:do i|should i|to) start|kahan se shuru|kaise karu|kya kya (?:karna|chahiye)|confused|roadmap|checklist|step by step|never (?:travelled|traveled|been abroad)|new to (?:travel|travelling|traveling))\b",
     "bookings": r"\b(my bookings?|pnr|(?:show|view|see|check) my trips?|booking status|cancel (?:my )?(?:booking|ticket|flight))\b",
 }
+
+
+MY_STAY = re.compile(r"\b(my|mera|meri|mere|apna|apne)\s+(hotel|stay|room|reservation|check ?-?in|check ?-?out)\b")
 
 
 @dataclass
@@ -57,6 +62,8 @@ class KeywordClassifier:
             hits.remove("nearby")
         if "bookings" in hits:
             return Intent("bookings")
+        if "hotel" in hits and MY_STAY.search(t):  # a question about a hotel they already booked
+            return Intent("buddy")
         if hits:
             return Intent(hits[0], slots, also=hits[1:])
         if slots.get("from") and slots.get("to"):  # "Indore to Goa tomorrow" with no keyword
@@ -82,6 +89,9 @@ class LLMClassifier:
                 "place": {"type": "string", "description": "For nearby: what they want to find near them, short (e.g. 'coffee', 'atm', 'biryani', 'pharmacy')"},
                 "country": {"type": "string", "description": "Destination COUNTRY for visa or forex questions (e.g. 'Thailand'), if stated"},
                 "time": {"type": "string", "description": "Time of day as 24h HH:MM, only if stated ('shaam 6 baje' = 18:00)"},
+                "currency": {"type": "string", "description": "For forex: the foreign currency they want, as a 3-letter ISO code (USD, AED...), if stated"},
+                "amount": {"type": "number", "description": "For forex: the amount they mentioned, if any"},
+                "amount_in_inr": {"type": "boolean", "description": "For forex: true if that amount is in rupees"},
                 "options": {**_service_list, "description": "If the request is vague, up to 3 services to offer, most useful first"},
                 "question": {"type": "string", "description": "If vague: one short clarifying question to ask with those options"},
                 "reply": {"type": "string", "description": "Only for smalltalk: one short friendly sentence"},
@@ -105,14 +115,17 @@ class LLMClassifier:
             "Services: flight (search/book flights), hotel (stays), cab (rides, airport pickup/drop), nearby (find "
             "places near the user: cafés, food, ATMs, pharmacies, petrol, parks, malls, sights; put what they want in "
             "`place`), planner (itineraries, multi-day trip planning), events (concerts, shows, festivals, things to do "
-            "near them), visa, forex (currency, travel cards). Flight, hotel, cab and visa are live; still route to the others. Other intents: bookings "
+            "near them), visa, forex (currency, travel cards), guide (a newcomer or an unsure traveller who wants the whole trip walked through step by step: what to do first, documents, deadlines, where to go). Flight, hotel, cab and visa are live; still route to the others. Other intents: bookings "
             "(view/cancel an existing booking or PNR), help (what can you do), buddy (personal talk: feelings, worries, "
             "problems, advice, general questions, anything that is not a travel request), smalltalk (greeting, thanks, "
             "chit-chat), unknown.\n"
             "Rules:\n"
             "- A problem or question about a trip that is ALREADY booked (running late, traffic, lost, directions, delays, "
-            "what to carry, bored between flights) is `buddy`, not `flight`. A message with 'near me' / 'nearby' for a "
+            "what to carry, bored between flights) is `buddy`, not `flight`. Same for a question about a hotel they ALREADY booked "
+            "(check-in time, amenities, cancellation, how to get there, other options nearby): `buddy`, not `hotel`. A message with 'near me' / 'nearby' for a "
             "place type is `nearby`; for shows or things to do it is `events`.\n"
+            "- A wish to travel somewhere ('jana hai New York', 'exploring USA', 'planning Japan') is a trip request, never "
+            "`buddy`: set to_city (a country counts) and intent `flight`.\n"
             "- Several things in one message: put the most useful to do first in `intent` and the rest in `also`, in "
             "trip order (flight, visa, forex, hotel, cab, events).\n"
             "- Vague message (e.g. 'I want to go to Goa', 'planning a Dubai trip'): intent unknown, `options` = the "
@@ -165,6 +178,12 @@ class LLMClassifier:
             slots["place"] = data["place"].strip()[:40]
         if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", data.get("time") or ""):
             slots["time"] = data["time"]
+        if re.fullmatch(r"[A-Za-z]{3}", data.get("currency") or ""):
+            slots["currency"] = data["currency"].upper()
+            if isinstance(data.get("amount"), (int, float)) and not isinstance(data.get("amount"), bool) and data["amount"] > 0:
+                slots["amount"] = float(data["amount"])
+                if data.get("amount_in_inr") is True:
+                    slots["amount_inr"] = True
         name = data.get("intent") if data.get("intent") in INTENTS else "unknown"
         services = lambda key: [x for x in dict.fromkeys(data.get(key) or []) if x in SERVICES and x != name]
         return Intent(name, slots, reply=(data.get("reply") or "").strip()[:300], also=services("also"),

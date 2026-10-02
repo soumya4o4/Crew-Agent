@@ -35,6 +35,7 @@ class PlannerAgent(Agent):
     title = "Trip Planner"
     emoji = "🗺️"
     menu_desc = "Share a reel, get a trip plan"
+    in_menu = False  # the Trip Guide offers it ("From a reel"), and shared reels and "plan a trip" text still reach it
     owns = frozenset({"planner", "rdays"})
 
     def __init__(self, repo, brain, links=None, download=None, send=None, video_parts=None, background: bool = True):

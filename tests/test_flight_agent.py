@@ -12,12 +12,12 @@ def test_full_booking_and_cancel():
     repo = FakeRepo()
     c = Chat(repo)
     c.enter_flights()
-    assert "menu:book" in c.ids()
+    assert "from:loc" in c.ids()
 
     origin = c.send(reply_id="menu:book")
-    assert {r[0] for r in origin["rows"]} == {"from:IDR", "from:BOM", "from:more"}  # own country first, others via "Another city"
+    assert {r[0] for r in origin["rows"]} == {"from:loc", "from:IDR", "from:BOM", "from:more"}  # own country first, others via "Another city"
     dest = c.send(reply_id="from:IDR")
-    assert {r[0] for r in dest["rows"]} == {"to:BOM", "to:DXB"}
+    assert {r[0] for r in dest["rows"]} == {"to:BOM", "to:more"}  # only places a flight goes to, the rest can be typed
     c.send(reply_id="to:BOM")
     c.send(reply_id=c.ids()[1])  # tomorrow
     results = c.send(reply_id="sort:cheap")
@@ -48,8 +48,7 @@ def test_typed_date_and_other_passenger():
     c.enter_flights()
     c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
     assert "understand that date" in c.send("blah")["body"]
-    assert c.send("kal")["type"] == "buttons"  # sort choice
-    c.send(reply_id="sort:time")
+    assert c.send("kal")["type"] == "list"  # straight to the flights
     c.send(reply_id=c.ids()[0])
     c.book()
     assert "full name" in c.send(reply_id="name:other")["body"].lower()
@@ -153,9 +152,9 @@ def test_no_flights_suggests_next_available_day():
             f[key] = (now_ist() + timedelta(days=3, hours=2)).isoformat()
     c = Chat(repo)
     c.enter_flights(); c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
-    c.send(reply_id=c.ids()[1]); out = c.send(reply_id="sort:time")  # tomorrow: nothing
-    assert "Next available" in out["body"] and c.ids()[0].startswith("date:")
-    assert c.send(reply_id=c.ids()[0])["type"] == "buttons"  # tapping it goes straight to sorting
+    out = c.send(reply_id=c.ids()[1])  # tomorrow: nothing
+    assert "No flights" in out["body"] and "has flights on these days" in out["body"] and c.ids()[0].startswith("date:")
+    assert c.send(reply_id=c.ids()[0])["rows"][0][0].startswith("flt:")  # tapping a day shows its flights
 
 
 def test_cheaper_nearby_day_tip():
@@ -169,3 +168,63 @@ def test_cheaper_nearby_day_tip():
     c.enter_flights(); c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
     c.send(reply_id=c.ids()[1])  # tomorrow: cheapest is Rs 3,500, the day after has Rs 2,000
     assert "cheaper" in c.send(reply_id="sort:cheap")["body"]
+
+
+def to_dxb_chat():
+    """A user who picked Indore and then typed Dubai: nothing flies Indore to Dubai, but Mumbai does."""
+    repo = FakeRepo()
+    dep = (now_ist() + timedelta(days=2)).replace(hour=9, minute=0, second=0, microsecond=0)
+    repo.flights["x1"] = {"id": "x1", "airline": "Emirates", "flight_no": "EK-501", "from_code": "BOM", "to_code": "DXB",
+                          "departure_time": dep.isoformat(), "arrival_time": (dep + timedelta(hours=3)).isoformat(),
+                          "duration_min": 180, "price_inr": 15000, "class": "Economy", "seats_left": 5, "baggage_kg": 25,
+                          "stops": 0, "refundable": True, "status": "scheduled"}
+    c = Chat(repo)
+    c.enter_flights(); c.send(reply_id="menu:book"); c.send(reply_id="from:IDR")
+    return c
+
+
+def test_a_route_with_no_flights_offers_the_cities_that_do_fly_there():
+    c = to_dxb_chat()
+    c.send(reply_id="to:more")
+    out = c.send("dubai")
+    assert "no direct flights from *Indore* to *Dubai*" in out["body"] and c.ids() == ["from:BOM"]
+    assert "km away" in out["rows"][0][2] and "from ₹15,000" in out["rows"][0][2] and "nearest to you" in out["body"]
+    assert "Got it" not in c.send(reply_id="from:BOM")["body"] and c.last[0]["type"] == "list"  # carries on to the date, Dubai remembered
+    assert "Mumbai ➜ Dubai" in c.last[0]["body"]
+
+
+def test_asking_for_dates_shows_the_days_that_have_flights():
+    c = Chat()
+    c.enter_flights(); c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
+    out = c.send("suggest me date in which flights are available")
+    assert "has flights on these days" in out["body"] and c.ids()[0].startswith("date:") and "from" in out["rows"][0][2]
+    assert c.send(reply_id=c.ids()[0])["rows"][0][0].startswith("flt:")
+
+
+def test_typing_cheapest_or_fastest_resorts_the_flights():
+    c = Chat()
+    c.enter_flights(); c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
+    c.send(reply_id=c.ids()[1])
+    out = c.send("cheapest")
+    assert "cheapest first" in out["body"] and out["rows"][0][2].startswith("₹3,500")
+
+
+def test_when_nothing_flies_to_the_destination_nearby_places_are_offered():
+    c = Chat()
+    c.enter_flights(); c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:more")
+    out = c.send("pune")                                                    # nobody flies to Pune in the fake data, but Mumbai is close
+    assert "can't fly to *Pune*" in out["body"] and c.ids() == ["to:BOM"] and "km from Pune" in out["rows"][0][2]
+    assert "Indore ➜ Mumbai" in c.send(reply_id="to:BOM")["body"]           # picking it carries on to the date
+
+
+def test_a_city_with_no_departures_offers_the_nearest_airports_that_have_some():
+    c = Chat()
+    c.enter_flights(); c.send(reply_id="menu:book")
+    out = c.send(reply_id="from:DXB") if False else None
+    c.concierge.repo.flights.clear()                                       # nothing flies from anywhere...
+    f = {"id": "z1", "airline": "IndiGo", "flight_no": "6E-1", "from_code": "BOM", "to_code": "IDR", "seats_left": 3, "status": "scheduled",
+         "departure_time": (now_ist() + timedelta(days=1)).isoformat(), "arrival_time": (now_ist() + timedelta(days=1, hours=2)).isoformat(),
+         "duration_min": 90, "price_inr": 4000, "class": "Economy", "baggage_kg": 15, "stops": 0, "refundable": False}
+    c.concierge.repo.flights["z1"] = f                                     # ...except Mumbai
+    out = c.send(reply_id="from:IDR")
+    assert "no flights leaving *Indore*" in out["body"] and c.ids() == ["from:BOM"] and "km away" in out["rows"][0][2]

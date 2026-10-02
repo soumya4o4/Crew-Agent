@@ -12,7 +12,7 @@ from app.agents.concierge.classifiers import Intent
 from app.agents.concierge.router import IntentRouter
 from app.core.messages import buttons_msg, list_msg, text_msg
 from app.core.geo import fresh_location, save_location
-from app.core.places import city, example_route, visa_code_for
+from app.core.places import city, example_route
 from app.core.safety import CRISIS_MESSAGE, is_crisis
 from app.core.utils import day_greeting, normalize_phone, now_ist
 
@@ -175,8 +175,10 @@ class Concierge:
             s.ctx["queue"], s.ctx["agent"] = [], "buddy"
             return await self.agents["buddy"].process(s, text, None)
 
-        if (place := intent.slots.get("unknown_to")) and intent.name in ("flight", "hotel", "cab", "events"):
-            return self._not_served(s, place)
+        if (place := intent.slots.get("unknown_to")) and "flight" in self.agents \
+                and intent.name not in ("bookings", "help", "nearby", "visa", "forex"):
+            s.ctx["queue"], s.ctx["agent"] = [], "flight"
+            return await self.agents["flight"].trip_idea(s, place)
 
         wanted = [n for n in dict.fromkeys([intent.name, *intent.also]) if n in self.agents]
         if wanted:
@@ -190,15 +192,6 @@ class Concierge:
                                        f"then I'll help with {later}. 👍"))
             return out
         return self._clarify(s, intent)
-
-    def _not_served(self, s: Session, place: str) -> list[dict]:
-        """They named a place we have no airport for. Say so, and offer what we can still do for that trip."""
-        code = visa_code_for(place)
-        options = [n for n in ("planner", "visa") if n in self.agents and (n != "visa" or code)]
-        s.step = "menu"
-        s.ctx["pending_slots"] = {"country": code} if code else {}
-        buttons = [(f"svc:{n}", f"{self.agents[n].emoji} {self.agents[n].title}") for n in options] + [("nav:menu", "🏠 Menu")]
-        return [buttons_msg(f"😕 I can't book travel to *{place}* yet. I can still help you get ready for it 👇", buttons)]
 
     @staticmethod
     def _is_personal(intent: Intent) -> bool:
@@ -246,7 +239,7 @@ class Concierge:
                     f"like *{example_route()} tomorrow*.")
         else:
             body = note or "What do you need next? 👇"
-        rows = [(f"svc:{a.name}", f"{a.emoji} {a.title}", a.menu_desc) for a in self.agents.values()]
+        rows = [(f"svc:{a.name}", f"{a.emoji} {a.title}", a.menu_desc) for a in self.agents.values() if a.in_menu]
         rows.append(("menu:bookings", "📋 My Bookings", "Your flights & trips"))
         return [list_msg(body, "Choose service", rows, "Services")]
 

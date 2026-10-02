@@ -13,16 +13,16 @@ TODAY = date(2026, 10, 1)  # a Thursday
 def test_main_menu_lists_every_service():
     c = Chat()
     assert c.send("hi")["type"] == "list"
-    assert c.ids() == ["svc:flight", "svc:hotel", "svc:cab", "svc:nearby", "svc:planner", "svc:events",
+    assert c.ids() == ["svc:guide", "svc:flight", "svc:hotel", "svc:cab", "svc:nearby", "svc:events",
                        "svc:visa", "svc:forex", "menu:bookings"]
     c.send(reply_id="svc:flight")
-    assert "menu:book" in c.ids()
+    assert "from:loc" in c.ids()  # Flights opens straight on "where from?", no menu to click through
 
 
 def test_free_text_flight_request_skips_known_steps():
     c = Chat()
     c.send("flight from indore to mumbai tomorrow")
-    assert "Got it" in c.last[0]["body"] and c.ids() == ["sort:cheap", "sort:fast", "sort:time"]
+    assert "Got it" in c.last[0]["body"] and c.ids()[0].startswith("flt:")
 
 
 def test_destination_only_asks_for_origin_then_continues():

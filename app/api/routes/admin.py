@@ -21,6 +21,11 @@ class VisaStatusUpdate(BaseModel):
     file_url: str | None = None # approved: link to the visa PDF (https://...) which we forward to the user
 
 
+class ForexStatusUpdate(BaseModel):
+    status: str                 # fulfilled
+    note: str | None = None     # shown to the user
+
+
 def _check_token(token: str | None) -> None:
     if not settings.ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="Admin API is disabled (set ADMIN_TOKEN)")
@@ -36,6 +41,21 @@ async def update_visa_status(ref: str, body: VisaStatusUpdate, x_admin_token: st
         number, messages = await get_concierge().agents["visa"].update_status(ref.upper(), body.status, body.note, body.file_url)
     except LookupError:
         raise HTTPException(status_code=404, detail="No such application")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    for m in messages:
+        await WhatsAppService.send(number, m)
+    return {"status": "ok", "notified": number}
+
+
+@router.post("/forex/{ref}/status")
+async def update_forex_status(ref: str, body: ForexStatusUpdate, x_admin_token: str | None = Header(default=None)):
+    """The forex desk calls this once cash is delivered or the card is issued. The user is notified on WhatsApp."""
+    _check_token(x_admin_token)
+    try:
+        number, messages = await get_concierge().agents["forex"].update_status(ref.upper(), body.status, body.note)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="No such order")
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     for m in messages:

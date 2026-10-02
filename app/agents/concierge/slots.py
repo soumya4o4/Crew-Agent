@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from app.core.geo import _ALIAS_RE
 from app.core.places import CITY_ALIASES, COUNTRY_ALIASES, city_pattern, country_pattern
 from app.core.utils import WEEKDAYS, parse_date
+from app.agents.forex.currencies import find_currency, parse_amount
 
 _MONTH = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
 NUMERIC_DATE = re.compile(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b")
@@ -65,6 +66,12 @@ def extract_slots(text: str, today: date) -> dict:
         slots["country"] = country
     if place := find_place(t):
         slots["place"] = place
+    if cur := find_currency(t):  # "100 usd", "dirhams for dubai": only when a currency is named do numbers mean money
+        slots["currency"] = cur
+        if (amt := parse_amount(t)) and amt[1] in (None, cur, "INR") and "date" not in slots:
+            slots["amount"] = amt[0]
+            if amt[1] == "INR":
+                slots["amount_inr"] = True
     return slots
 
 

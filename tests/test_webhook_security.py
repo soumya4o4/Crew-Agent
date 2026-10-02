@@ -40,6 +40,7 @@ def client(monkeypatch):
     monkeypatch.setattr(route, "get_concierge", lambda: FakeConcierge())
     monkeypatch.setattr(WhatsAppService, "send", staticmethod(fake_send))
     monkeypatch.setattr(WhatsAppService, "mark_read", staticmethod(noop))
+    route._seen.clear()
     http = TestClient(app)
     http.handled, http.sent = handled, sent
     return http
@@ -103,7 +104,8 @@ def test_escaped_form_of_the_body_matches_what_meta_signs():
 
 def test_messages_with_hindi_and_emoji_are_accepted_whichever_form_was_signed(client):
     raw_signed, escaped_signed = sign(EMOJI_BODY), sign(WhatsAppService._escape_unicode(EMOJI_BODY))
-    for signature in (raw_signed, escaped_signed):
+    for n, signature in enumerate((raw_signed, escaped_signed)):
+        route._seen.clear()                                    # the same message again, as if it were a new one
         assert post(client, EMOJI_BODY, **{"X-Hub-Signature-256": signature}).status_code == 200
     assert len(client.handled) == 2 and client.handled[0][3] == "नमस्ते 😀 Goa"
     assert post(client, EMOJI_BODY, **{"X-Hub-Signature-256": sign(EMOJI_BODY, "other")}).status_code == 403   # still needs the secret
@@ -115,3 +117,10 @@ def test_the_rejection_log_says_why_without_leaking_anything(client, monkeypatch
     assert "different Meta app" in why(BODY, sign(BODY, "other")) and SECRET not in why(BODY, sign(BODY, "other"))
     monkeypatch.setattr(settings, "WHATSAPP_APP_SECRET", "")
     assert "not set" in why(BODY, sign(BODY))
+
+
+def test_a_retried_message_is_handled_only_once(client):
+    first = post(client, **{"X-Hub-Signature-256": sign(BODY)})
+    retry = post(client, **{"X-Hub-Signature-256": sign(BODY)})            # Meta resending because we looked slow
+    assert first.json() == {"status": "success"} and retry.json() == {"status": "duplicate"}
+    assert len(client.handled) == 1 and len(client.sent) == 1

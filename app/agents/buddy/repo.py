@@ -47,6 +47,18 @@ class BuddyRepo(CoreRepo):
                 .order("check_in").limit(1).execute().data)
         return rows[0] if rows else None
 
+    def user_stays(self, user_id: str, limit: int = 3) -> list[dict]:
+        """Hotel stays the user has booked that are not over yet (confirmed, or waiting for payment), soonest first."""
+        today = now_ist().date()
+        return (self.db.table("hotel_bookings").select("*, hotels(*), hotel_rooms(*)").eq("user_id", user_id)
+                .in_("status", ["confirmed", "pending"]).gte("check_out", today.isoformat())
+                .order("check_in").limit(limit).execute().data)
+
+    def paid_payments(self, user_id: str, limit: int = 40) -> list[dict]:
+        """The user's paid payments, newest first: [{amount_inr, kind, paid_at}]. kind is flight, hotel, visa or forex."""
+        return (self.db.table("payments").select("amount_inr, kind, paid_at").eq("user_id", user_id).eq("status", "paid")
+                .order("paid_at", desc=True).limit(limit).execute().data)
+
     def forget_user(self, user_id: str) -> None:
         """Delete everything we remember and the stored chat history. Bookings and payments are business records and stay."""
         self.db.table("user_memories").delete().eq("user_id", user_id).execute()
