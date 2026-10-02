@@ -55,12 +55,19 @@ def maps_link(lat: float | None = None, lon: float | None = None, query: str | N
     return f"https://www.google.com/maps/dir/?api=1&destination={dest}&travelmode=driving"
 
 
-def nearest_city(lat: float, lon: float, max_km: int = 60) -> str | None:
-    """The airport city (from the `airports` table) closest to a point, if within max_km."""
-    if not AIRPORT_COORDS:
+def nearest_city(lat: float, lon: float, max_km: int = 60, among: set[str] | None = None) -> str | None:
+    """The airport city (from the `airports` table) closest to a point, if within max_km. `among` limits the candidates
+    (for example the cities that have hotels)."""
+    coords = {c: xy for c, xy in AIRPORT_COORDS.items() if among is None or c in among}
+    if not coords:
         return None
-    code, dist = min(((c, haversine_m(lat, lon, *xy)) for c, xy in AIRPORT_COORDS.items()), key=lambda t: t[1])
+    code, dist = min(((c, haversine_m(lat, lon, *xy)) for c, xy in coords.items()), key=lambda t: t[1])
     return code if dist <= max_km * 1000 else None
+
+
+# "hotel near me", "meri current location dekh ke batao": the user wants us to use where they are, not a city name
+NEAR_ME = re.compile(r"\b(near ?me|near ?by|around me|aas ?paas|paas mein|mere paas|nearest|closest|my (?:current |live )?location|"
+                     r"(?:current|live) location|meri (?:current )?location|where i am|yahan|yaha|here)\b")
 
 
 # ---- the user's last shared location lives in the conversation context: ctx["loc"]

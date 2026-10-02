@@ -212,6 +212,9 @@ class FakeRepo:
         self.cab_rides[rid].update(status="cancelled", cancel_fee_inr=fee)
 
 
+CONTACT = "Aarav Sharma, aarav@example.com, 9876543210"  # what a traveller sends when asked for name, email and phone
+
+
 class FakeGateway:
     """Stands in for Razorpay: records links, and the test decides when a link counts as paid."""
     enabled, test_mode = True, True
@@ -219,11 +222,12 @@ class FakeGateway:
     def __init__(self):
         self.links, self.paid, self.cancelled, self.fail = {}, set(), set(), False
 
-    async def create_link(self, amount_inr, reference_id, description, phone, name, expire_minutes):
+    async def create_link(self, amount_inr, reference_id, description, phone, name, expire_minutes, email=""):
         if self.fail:
             raise RuntimeError("razorpay down")
         link_id = f"plink_{len(self.links) + 1}"
-        self.links[link_id] = {"amount": amount_inr, "ref": reference_id, "phone": phone}
+        self.links[link_id] = {"amount": amount_inr, "ref": reference_id, "phone": phone, "email": email, "name": name,
+                               "description": description}
         return {"id": link_id, "short_url": f"https://rzp.io/i/{link_id}"}
 
     async def link_status(self, link_id):
@@ -304,6 +308,6 @@ class Chat:
         return self.send(reply_id=name_reply)
 
     def book(self, travellers=1):
-        """Tap Book Now; answers the 'how many travellers' list when it appears."""
+        """Tap Book Now; with more than one traveller, say how many (one traveller goes straight to the summary)."""
         out = self.send(reply_id="act:book")
-        return self.send(reply_id=f"pax:{travellers}") if out["type"] == "list" else out
+        return self.send(reply_id=f"pax:{travellers}") if travellers > 1 else out

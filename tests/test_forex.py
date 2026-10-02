@@ -84,7 +84,7 @@ def test_rate_service_fetches_once_and_keeps_the_last_rates_if_the_service_goes_
 # ------------------------------------------------------------------------------- the flow
 def test_menu_lists_forex_and_is_live():
     c = Chat()
-    c.send("hi")
+    c.send("hi"); c.send(reply_id="nav:menu")
     assert c.last[0]["rows"][-2][2] == "Currency, cards & live rates" or "svc:forex" in c.ids()
     out = c.send(reply_id="svc:forex")
     assert "Forex" in out["body"] and c.ids() == ["fx:buy", "fx:rates", "fx:orders"]

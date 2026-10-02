@@ -67,6 +67,15 @@ def city_pattern() -> re.Pattern:
     return _city_re[1]
 
 
+def find_city(text: str) -> str | None:
+    """Airport code for a place named in free text: "chennai", "I am going to Chennai", "lets do bombay"."""
+    low = " ".join((text or "").lower().replace(",", " ").split())
+    if code := CITY_ALIASES.get(low):
+        return code
+    m = city_pattern().search(low)
+    return CITY_ALIASES[m.group(1)] if m else None
+
+
 # What people type -> visa_rules country_code. `load_visa_countries` adds every country name in the database.
 COUNTRY_ALIASES = {
     "uae": "AE", "united arab emirates": "AE", "dubai": "AE", "abu dhabi": "AE", "emirates": "AE", "sharjah": "AE",

@@ -30,10 +30,10 @@ def card_buttons(c):
 def test_a_reel_link_with_a_caption_becomes_a_trip_card():
     c = planner_chat()
     c.send(f"{REEL} goa vibes")
-    assert [m["type"] for m in c.last] == ["text", "buttons"] and "Dekh rahe hain" in c.last[0]["body"]
+    assert [m["type"] for m in c.last] == ["text", "buttons"] and "Taking a look" in c.last[0]["body"]
     card = c.last[1]["body"]
     assert "*Palolem Beach, South Goa, India*" in card and "📍 Palolem Beach · Cabo de Rama Fort" in card and "Nov to Feb" in card
-    assert "book kar sakte hain" in card and card_buttons(c) == ["planner:plan", "planner:fix", "nav:menu"]
+    assert "I can book flights" in card and card_buttons(c) == ["planner:plan", "planner:fix", "nav:menu"]
     call = c.planner_brain.calls[0]
     assert call["frames"] == [] and "goa vibes" in call["text"] and "Goa shack life" in call["text"] and REEL not in call["text"]
     assert c.repo.convos["+" + WA]["current_step"] == "planner_review"
@@ -43,7 +43,7 @@ def test_a_link_with_no_caption_asks_for_a_video_or_screenshot():
     c = planner_chat()
     c.media.link_meta = {"title": "", "description": ""}
     c.send(REEL)
-    assert "video* ya *screenshot*" in c.last[-1]["body"] and c.planner_brain.calls == []
+    assert "*video* or a *screenshot*" in c.last[-1]["body"] and c.planner_brain.calls == []
     assert c.repo.convos["+" + WA]["current_step"] == "planner_fix"
 
 
@@ -74,20 +74,20 @@ def test_when_the_reel_cannot_be_read_the_user_is_asked_to_help():
     c = planner_chat()
     c.media.too_big = True
     c.send_file(mime="video/mp4", kind="video")
-    assert "bahut bada" in c.last[-1]["body"] and c.repo.convos["+" + WA]["current_step"] == "planner_fix"
+    assert "too big" in c.last[-1]["body"] and c.repo.convos["+" + WA]["current_step"] == "planner_fix"
     c.media.too_big, c.planner_brain.none = False, True
     c.send_file(mime="video/mp4", kind="video")
-    assert "pakki samajh nahi aayi" in c.last[-1]["body"]
+    assert "couldn't tell the place" in c.last[-1]["body"]
     c.planner_brain.none, c.planner_brain.fail = False, True
     c.send(REEL)
-    assert "dikkat aayi" in c.last[-1]["body"]
+    assert "trouble reading" in c.last[-1]["body"]
 
 
 def test_a_low_confidence_guess_says_so():
     c = planner_chat()
     c.planner_brain.insight = Insight(label="Somewhere, Goa", city_code="GOI", confidence="low")
     c.send(REEL)
-    assert "Pakka nahi hai" in c.last[-1]["body"]
+    assert "Not fully sure" in c.last[-1]["body"]
 
 
 def test_typing_a_place_works_and_so_does_correcting_a_wrong_guess():
@@ -120,7 +120,7 @@ def test_the_user_picks_the_days_and_gets_a_day_by_day_plan():
     rows = make_plan(c)["rows"]
     assert [r[0] for r in rows] == [f"rdays:{n}" for n in range(1, 8)] and rows[2][2] == "Suggested for this reel"
     plan = c.last[0]["body"]
-    assert "3 din, Palolem Beach" in plan and "*Day 1 · Theme 1*" in plan and "*Day 3 · Theme 3*" in plan and "Sunscreen le jao" in plan
+    assert "3-day trip: Palolem Beach" in plan and "*Day 1 · Theme 1*" in plan and "*Day 3 · Theme 3*" in plan and "Sunscreen le jao" in plan
     assert c.planner_brain.plans == [("Palolem Beach, South Goa, India", 3)]
     assert card_buttons(c) == ["planner:book", "planner:days", "nav:menu"]
 
@@ -129,9 +129,9 @@ def test_booking_the_trip_hands_over_to_flights_and_keeps_the_rest_queued():
     c = planner_chat()
     make_plan(c)
     c.send(reply_id="planner:book")
-    assert "Chalo, pehle flights" in c.last[0]["body"] and "from:IDR" in c.ids()  # the flight flow starts with Goa as the destination
+    assert "start with flights" in c.last[0]["body"] and "flying from" in c.last[-1]["body"]  # the flight flow starts with Goa as the destination
     ctx = c.repo.convos["+" + WA]["context"]
-    assert ctx["queue"] == ["hotel", "cab", "events"] and ctx["pre_to"] == "GOI"
+    assert ctx["queue"] == ["hotel", "cab", "events"] and ctx["to"] == "GOI"
 
 
 def test_the_hotel_flow_knows_the_trip_length():
@@ -141,14 +141,14 @@ def test_the_hotel_flow_knows_the_trip_length():
     c.repo.convos["+" + WA]["context"]["trip"] = {"from": "IDR", "to": "GOI", "city": "Goa", "date": date.today().isoformat(), "arrival": None}
     c.send(reply_id="svc:hotel")
     c.send(reply_id="hotel:trip")
-    assert c.ids() == ["hgst:1", "hgst:2", "hgst:3", "hgst:4"]  # city, check-in and 3 nights (4 days) are already known
+    assert "How many guests" in c.last[-1]["body"]  # city, check-in and 3 nights (4 days) are already known
 
 
 def test_a_place_we_cannot_book_still_gets_a_plan_and_a_map():
     c = planner_chat()
     c.planner_brain.insight = Insight(label="Munnar, Kerala, India", city_code=None, places=["Tea gardens"], confidence="high")
     c.send(REEL)
-    assert "booking abhi hamare paas nahi" in c.last[-1]["body"]
+    assert "can't book this place yet" in c.last[-1]["body"]
     c.send(reply_id="planner:plan"); c.send(reply_id="rdays:2")
     assert [m["type"] for m in c.last] == ["text", "cta", "buttons"]
     assert "destination=Munnar%2C+Kerala%2C+India" in c.last[1]["url"] and "planner:book" not in card_buttons(c)
@@ -158,12 +158,12 @@ def test_a_failed_plan_can_be_retried():
     c = planner_chat()
     c.send(REEL); c.send(reply_id="planner:plan")
 
-    async def boom(insight, days):
+    async def boom(insight, days, hinglish=False):
         raise RuntimeError("down")
 
     c.planner_brain.itinerary = boom
     out = c.send(reply_id="rdays:3")
-    assert "Plan banane mein dikkat" in out["body"] and "rdays:3" in card_buttons(c)
+    assert "trouble writing the plan" in out["body"] and "rdays:3" in card_buttons(c)
 
 
 def test_stale_buttons_do_not_crash():
@@ -186,7 +186,7 @@ def test_in_the_background_the_user_gets_an_answer_at_once_and_the_result_later(
         return out
 
     out = asyncio.run(go())
-    assert [m["body"][:12] for m in out] == ["🎬 Reel mil g"]
+    assert [m["body"][:12] for m in out] == ["🎬 Got your r"]
     assert [n for n, _ in media.sent] == [WA] and "Palolem Beach" in media.sent[0][1]["body"]
     saved = repo.convos["+" + WA]
     assert saved["current_step"] == "planner_review" and saved["context"]["plan"]["city_code"] == "GOI" and saved["context"]["agent"] == "planner"
@@ -197,7 +197,7 @@ def test_a_crash_in_the_background_still_tells_the_user():
     brain.fail = True
     agent = PlannerAgent(repo, brain, media, media.download, media.send, media.video_parts, background=True)
     asyncio.run(agent._deliver("+" + WA, {"media": None, "link": REEL, "text": ""}))
-    assert "dikkat aayi" in media.sent[0][1]["body"] and repo.convos["+" + WA]["current_step"] == "planner_fix"
+    assert "trouble reading" in media.sent[0][1]["body"] and repo.convos["+" + WA]["current_step"] == "planner_fix"
 
 
 # ------------------------------------------------------------------------- media helpers
@@ -323,3 +323,39 @@ def test_the_openai_calls_send_frames_text_and_ask_for_json():
     assert len(parts) == 1 + 6 and parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,") and parts[1]["image_url"]["detail"] == "low"
     assert asyncio.run(brain.itinerary(insight, 1))["days"][0]["title"] == "t" and "Days: 1" in seen[1]["messages"][1]["content"]
     assert asyncio.run(brain.transcribe(b"audio")) == "hello goa" and seen[2]["model"] == "test-whisper"
+
+
+def test_a_place_typed_after_a_reel_could_not_be_read_is_trusted():
+    c = planner_chat()
+    c.planner_brain.none = True
+    c.send(REEL)
+    assert "couldn't tell the place" in c.last[-1]["body"]
+    c.planner_brain.none = False
+    c.send("switzerland")
+    assert c.planner_brain.calls[-1]["named"] is True and c.last[0]["type"] == "buttons"
+
+
+def test_the_bot_writes_english_to_english_speakers_and_hinglish_to_hinglish():
+    from app.core.lang import update_language
+    ctx = {}
+    update_language(ctx, "Could you tell me where is this?")
+    assert ctx["hinglish"] is False
+    update_language(ctx, "bhai ye kahan hai")
+    assert ctx["hinglish"] is True
+    update_language(ctx, "Switzerland")  # one word does not flip the language back
+    assert ctx["hinglish"] is True
+    update_language(ctx, "I want to fly to Paris tomorrow")
+    assert ctx["hinglish"] is False
+
+
+def test_an_explicit_language_request_wins_and_sticks():
+    from app.core.lang import language_name, update_language
+    ctx = {}
+    update_language(ctx, "Talk me in hindi")
+    assert language_name(ctx).startswith("Hinglish")
+    update_language(ctx, "I want to fly to Paris tomorrow")  # a plain English sentence does not undo the request
+    assert language_name(ctx).startswith("Hinglish")
+    update_language(ctx, "please reply in english")
+    assert language_name(ctx) == "English"
+    update_language(ctx, "मुझे गोवा जाना है")
+    assert language_name(ctx) == "Hindi in Devanagari script"

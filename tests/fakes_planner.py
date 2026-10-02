@@ -10,8 +10,8 @@ class FakePlannerBrain:
                                activities=["kayaking", "beach shacks"], vibe="Laid-back beaches", season="Nov to Feb", days=3, confidence="high")
         self.none, self.fail, self.transcript, self.calls, self.plans = False, False, "spoken words", [], []
 
-    async def analyze(self, frames, transcript="", text=""):
-        self.calls.append({"frames": frames, "transcript": transcript, "text": text})
+    async def analyze(self, frames, transcript="", text="", user_named=False):
+        self.calls.append({"frames": frames, "transcript": transcript, "text": text, "named": user_named})
         if self.fail:
             raise RuntimeError("openai down")
         return None if self.none else self.insight
@@ -19,7 +19,7 @@ class FakePlannerBrain:
     async def transcribe(self, audio):
         return self.transcript
 
-    async def itinerary(self, insight, days):
+    async def itinerary(self, insight, days, hinglish=False):
         self.plans.append((insight.label, days))
         return {"days": [{"title": f"Theme {i + 1}", "morning": "Subah ghoomo", "afternoon": "Lunch aur rest", "evening": "Sunset"} for i in range(days)],
                 "tips": ["Sunscreen le jao"]}

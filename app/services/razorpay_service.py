@@ -20,7 +20,8 @@ class RazorpayService:
 
     @staticmethod
     async def create_payment_link(amount_inr: int, reference_id: str, description: str, phone: str,
-                                  name: str = "", expire_minutes: int = 20, client: httpx.AsyncClient | None = None) -> dict:
+                                  name: str = "", expire_minutes: int = 20, client: httpx.AsyncClient | None = None,
+                                  email: str = "") -> dict:
         """Returns {"id", "short_url"}. reference_id comes back in the webhook, so it ties a payment to a booking.
         Razorpay needs expire_by to be at least 15 minutes away."""
         import time
@@ -29,7 +30,7 @@ class RazorpayService:
             "currency": "INR",
             "reference_id": reference_id,
             "description": description[:255],
-            "customer": {"contact": phone, **({"name": name} if name else {})},
+            "customer": {"contact": phone, **({"name": name} if name else {}), **({"email": email} if email else {})},
             "notify": {"sms": False, "email": False},  # we deliver the link on WhatsApp ourselves
             "expire_by": int(time.time()) + max(expire_minutes, 16) * 60,
         }
@@ -61,8 +62,9 @@ class RazorpayGateway:
         return RazorpayService.is_test_mode()
 
     async def create_link(self, amount_inr: int, reference_id: str, description: str, phone: str, name: str,
-                          expire_minutes: int) -> dict:
-        return await RazorpayService.create_payment_link(amount_inr, reference_id, description, phone, name, expire_minutes)
+                          expire_minutes: int, email: str = "") -> dict:
+        return await RazorpayService.create_payment_link(amount_inr, reference_id, description, phone, name, expire_minutes,
+                                                         email=email)
 
     async def link_status(self, link_id: str) -> str:
         """'created', 'paid', 'cancelled' or 'expired'."""

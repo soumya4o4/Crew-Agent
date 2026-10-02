@@ -12,12 +12,13 @@ import re
 from datetime import date, datetime, timedelta
 
 from app.agents.base import Agent, Session
+from app.agents.flight.nlu import parse_trip
 from app.agents.flight.formatting import (NEXT_STEPS, PITCH, city_tip, countdown, flight_card, flight_row, flight_tags,
                                           suggest_steps)
 from app.core.geo import fresh_location, haversine_m, nearest_city
 from app.core.places import AIRPORT_COORDS
 from app.core.messages import buttons_msg, cta_msg, list_msg, location_request_msg, reaction_msg, text_msg
-from app.core.places import CITIES, CITY_ALIASES, city, city_pattern, country_of, is_international, visa_code_for
+from app.core.places import CITIES, city, example_route, find_city, country_of, is_international, visa_code_for
 from app.core.utils import IST, day_greeting, dur, inr, now_ist, parse_date, to_ist
 
 MAX_DAYS_AHEAD = 29
@@ -33,7 +34,12 @@ ASKING_FOR_DATES = re.compile(r"\b(suggest|available|availability|which date|wha
 STATUS_ICON = {"confirmed": "✅", "pending": "⏳", "cancelled": "❌"}
 MENU_BUTTONS = [("menu:book", "🔍 Find flights"), ("menu:bookings", "🎫 My trips"), ("nav:menu", "🏠 Main menu")]
 TRIP_KEYS = ("from", "to", "date", "sort", "flight_id", "passenger_name", "flight_summary", "explore", "pre_to",
-             "pre_date", "pax", "names", "unit_price", "min_date", "await_flight", "visa_advice", "city_for", "await_place")
+             "pre_date", "pax", "names", "unit_price", "min_date", "await_flight", "visa_advice", "city_for", "await_place",
+             "return_date", "pax_hint")
+YES = {"yes", "y", "ok", "okay", "confirm", "book", "book it", "book now", "haan", "ha", "kar do", "done", "sure", "go ahead"}
+NO = {"no", "n", "cancel", "nahi", "nope", "drop it"}
+PASSPORT_FIX = ("change passport", "wrong passport", "passport change")
+NAME_PART = re.compile(r"[A-Za-z][A-Za-z .'\-]{1,59}")
 MAX_ROWS = 8  # a WhatsApp list holds 10 rows; the last one is "Another city…" when there are more places than fit
 
 
@@ -48,6 +54,7 @@ class FlightAgent(Agent):
     emoji = "✈️"
     menu_desc = "Search, book & manage trips"
     owns = frozenset({"menu", "trip", "from", "to", "date", "sort", "flt", "act", "pax", "name", "cfm", "pay", "bk", "bkc", "bkcy", "cz"})
+    bundleable = True
 
     def __init__(self, repo, payments=None, advisor=None):
         self.repo = repo  # FlightRepo
@@ -59,7 +66,13 @@ class FlightAgent(Agent):
             s.ctx.pop(k, None)
 
     def expects_text(self, s: Session) -> bool:
-        return s.step in ("awaiting_date", "awaiting_name", "awaiting_citizen", "awaiting_city", "awaiting_flight")
+        return s.step in ("awaiting_trip", "awaiting_date", "awaiting_name", "awaiting_citizen", "awaiting_city", "awaiting_flight",
+                          "awaiting_flight_action", "awaiting_confirm")
+
+    def keeps_text(self, text: str, other, known: set[str]) -> bool:
+        if text.lower().strip() in PASSPORT_FIX:  # "change passport" would otherwise read as a visa request
+            return True
+        return super().keeps_text(text, other, known)
 
     def expects_location(self, s: Session) -> bool:
         return s.step == "awaiting_origin_loc"
@@ -78,33 +91,77 @@ class FlightAgent(Agent):
         return ([text_msg(note)] if note else []) + out
 
     async def on_enter(self, s: Session) -> list[dict]:
-        """No menu to click through: straight to where they are flying from, with their last route one tap away."""
+        """No menu to click through: one question that takes the whole trip in a single message."""
         for k in TRIP_KEYS:
             s.ctx.pop(k, None)
-        return await self._ask_origin(s, intro="✈️ *Flights*\n")
+        return self._ask_trip(s, intro="✈️ *Flights*\n")
 
     async def start(self, s: Session, slots: dict) -> list[dict]:
-        """Free text like "Indore to Goa tomorrow": pre-fill what we heard, ask only for the rest."""
+        """Free text like "Indore to Goa tomorrow, round trip": take everything we heard, ask only for the rest."""
         for k in TRIP_KEYS:
             s.ctx.pop(k, None)
-        c, today = s.ctx, now_ist().date()
-        frm, to, d = slots.get("from"), slots.get("to"), slots.get("date")
-        frm, to = (x if x in CITIES else None for x in (frm, to))
-        if to == frm:
+        today = now_ist().date()
+        said = parse_trip(slots["text"], today) if slots.get("text") else {}
+        for k in ("from", "to", "date"):
+            if slots.get(k):
+                said[k] = slots[k]
+        notes = self._take(s, said)
+        c = s.ctx
+        heard = " ".join(x for x in (f"from {city(c['from'])}" if c.get("from") else "", f"to {city(c['to'])}" if c.get("to") else "",
+                                     f"on {date.fromisoformat(c['date']):%a, %d %b}" if c.get("date") else "",
+                                     f"and back on {date.fromisoformat(c['return_date']):%a, %d %b}" if c.get("return_date") else "") if x)
+        intro = [text_msg(f"Got it! ✈️ Flying {heard}.")] if heard else []
+        return intro + [text_msg(n) for n in notes] + await self._advance(s)
+
+    def _take(self, s: Session, said: dict) -> list[str]:
+        """Keep what the message told us about the trip (only valid parts); returns notes about parts we could not use."""
+        c, notes, today = s.ctx, [], now_ist().date()
+        frm, to = (said.get(k) if said.get(k) in CITIES else None for k in ("from", "to"))
+        if frm and frm == to:
             to = None
-        if d and not (today <= date.fromisoformat(d) <= today + timedelta(days=MAX_DAYS_AHEAD)):
-            d = None
         if frm:
             c["from"] = frm
-        if to:
-            c["to" if frm else "pre_to"] = to
-        if d:
-            c["date" if (frm and to) else "pre_date"] = d
-        heard = [f"from {city(frm)}" if frm else "", f"to {city(to)}" if to else "",
-                 f"on {date.fromisoformat(d):%a, %d %b}" if d else ""]
-        heard = " ".join(h for h in heard if h)
-        intro = [text_msg(f"Got it! ✈️ Flying {heard}.")] if heard else []
-        return intro + await self._advance(s)
+        if to and to != c.get("from"):
+            c["to"] = to
+        for key in ("date", "return_date"):
+            if d := said.get(key):
+                if today <= date.fromisoformat(d) <= today + timedelta(days=MAX_DAYS_AHEAD):
+                    c[key] = d
+                elif key == "date":
+                    notes.append("😕 I can book flights within the next 30 days, so please pick a closer date.")
+        if c.get("return_date") and c.get("date") and c["return_date"] < c["date"]:
+            c.pop("return_date")
+        if 1 <= said.get("pax", 0) <= 6:
+            c["pax_hint"] = said["pax"]
+        return notes
+
+    def _ask_trip(self, s: Session, intro: str = "") -> list[dict]:
+        """One plain-text question for everything still missing (route, date), with an example to copy."""
+        s.step = "awaiting_trip"
+        c = s.ctx
+        have = (f"{city(c['from'])} ➜ {city(c['to'])}" if c.get("from") and c.get("to") else
+                f"from {city(c['from'])}" if c.get("from") else f"to {city(c['to'])}" if c.get("to") else "")
+        missing = [w for w, k in (("where you're flying from", "from"), ("where to", "to"), ("the date", "date")) if not c.get(k)]
+        ask = ", ".join(missing[:-1]) + (" and " if len(missing) > 1 else "") + missing[-1] if missing else "the date"
+        lead = f"👍 *{have}*\n" if have else ""
+        return [text_msg(f"{intro}{lead}Tell me {ask}, and add a return date if you want a round trip.\n"
+                         f"Like: *{example_route()}, 12 Oct, round trip till 15 Oct*")]
+
+    async def _on_trip_text(self, s: Session, text: str) -> list[dict]:
+        """Any typed message while we are working out the trip: it can carry the route, dates and party all at once."""
+        c, today = s.ctx, now_ist().date()
+        said = parse_trip(text, today)
+        if said.get("to") and not said.get("from") and c.get("to") and not c.get("from"):
+            said["from"] = said.pop("to")  # a lone city answers whichever end is still empty
+        elif said.get("from") and not said.get("to") and c.get("from") and not c.get("to"):
+            said["to"] = said.pop("from")
+        notes = self._take(s, said)
+        if not any(k in said for k in ("from", "to", "date")) and not notes:
+            low = text.lower().strip()
+            if c.get("from") and c.get("to") and ASKING_FOR_DATES.search(low):
+                return await self._suggest_dates(s)
+            return [text_msg("😕 Sorry, I didn't catch that.")] + self._ask_trip(s)
+        return [text_msg(n) for n in notes] + await self._advance(s)
 
     async def _db(self, fn, *args):
         return await asyncio.to_thread(fn, *args)
@@ -118,10 +175,30 @@ class FlightAgent(Agent):
         low = text.lower()
         if low in GREETINGS or low in ("menu", "restart", "reset", "home", "cancel"):
             return self._menu(s, greet=True)
+        if low in PASSPORT_FIX:
+            s.ctx.pop("citizen", None)
+            if s.ctx.get("flight_id"):  # looking at a flight right now: ask at once and show it again with the right advice
+                s.ctx["await_flight"], s.step = s.ctx.pop("flight_id"), "awaiting_citizen"
+                return [text_msg("✏️ Which passport will you travel on? Type the country, like *Nepal* or *United Kingdom*.")]
+            return [text_msg("👍 Okay! I'll ask for your passport country again on your next international flight.")]
+        if s.step == "awaiting_trip":
+            return await self._on_trip_text(s, text)
         if s.step == "awaiting_date":
+            if not s.ctx.get("explore") and any(k in parse_trip(text, now_ist().date()) for k in ("date", "return_date")):
+                return await self._on_trip_text(s, text)
             return await self._on_date_text(s, text)
         if s.step == "awaiting_name":
             return self._on_name_text(s, text)
+        if s.step == "awaiting_flight_action" and s.ctx.get("flight_id"):
+            return await self._on_booking_text(s, text)
+        if s.step == "awaiting_confirm" and s.ctx.get("flight_id"):
+            if low in YES:
+                return await self._on_reply(s, "cfm:yes")
+            if low in NO:
+                return await self._on_reply(s, "cfm:no")
+            if names := self._parse_names(text, s):
+                return self._set_names(s, names)
+            return self._confirm(s)
         if s.step == "awaiting_citizen":
             return await self._on_citizen_text(s, text)
         if s.step == "awaiting_city":
@@ -129,10 +206,9 @@ class FlightAgent(Agent):
         if s.step == "awaiting_flight" and s.ctx.get("date") and not s.ctx.get("explore"):  # "cheapest", "fastest": re-sort the list
             if low in SORT_WORDS:
                 s.ctx["sort"] = SORT_WORDS[low]
+            elif any(k in parse_trip(text, now_ist().date()) for k in ("from", "to", "date")):  # "make it 15 oct" / "to goa instead"
+                return await self._on_trip_text(s, text)
             return await self._show_results(s)
-        if low in ("change passport", "wrong passport", "passport change"):
-            s.ctx.pop("citizen", None)
-            return [text_msg("👍 Okay! I'll ask for your passport country again on your next international flight.")]
         if low in ("help", "?"):
             return self._help(s)
         if low in THANKS:
@@ -171,15 +247,17 @@ class FlightAgent(Agent):
             return await self._on_trip(s, val)
         elif kind == "from":
             c["from"] = val
-            c.pop("to", None)
-            c.pop("date", None)
             if c.get("explore"):
+                c.pop("to", None)
+                c.pop("date", None)
                 return self._ask_date(s)
             pre_to, pre_date = c.pop("pre_to", None), c.pop("pre_date", None)
             if pre_to and pre_to != val:  # user already told us where they're going
                 c["to"] = pre_to
                 if pre_date:
                     c["date"] = pre_date
+            elif c.get("to") == val:
+                c.pop("to", None)
             return await self._advance(s)
         elif kind == "to" and c.get("from"):
             c["to"] = val
@@ -209,8 +287,12 @@ class FlightAgent(Agent):
             return await (self._show_explore(s) if c.get("explore") else self._show_results(s))
         elif kind == "act" and val == "return" and c.get("trip"):
             trip = c["trip"]
+            back = trip.get("return_date")
             self.reset(s)
             c["from"], c["to"], c["min_date"] = trip["to"], trip["from"], trip["date"]
+            if back and date.fromisoformat(back) >= now_ist().date():  # they already told us when they come back
+                c["date"] = back
+                return await self._advance(s)
             return self._ask_date(s)
         elif kind == "act" and val == "book" and c.get("flight_id"):
             return await self._ask_travellers(s)
@@ -227,7 +309,7 @@ class FlightAgent(Agent):
                 return await self._do_booking(s)
             if val == "name":
                 c["names"] = []
-                return self._ask_passenger(s)
+                return self._prompt_name(s)
             return self._menu(s, note="No worries, I've dropped that booking. 👍")
         elif kind == "pay" and val in ("check", "cancel"):
             return await self._on_payment_tap(s, val)
@@ -287,6 +369,8 @@ class FlightAgent(Agent):
         return max(counts, key=counts.get) if counts else ""
 
     async def _ask_origin(self, s: Session, intro: str = "") -> list[dict]:
+        if not s.ctx.get("explore"):
+            return self._ask_trip(s, intro)
         s.step = "awaiting_origin"
         airports = await self._db(self.repo.list_airports)
         home = await self._home_country(s, airports)
@@ -308,12 +392,14 @@ class FlightAgent(Agent):
     async def _advance(self, s: Session) -> list[dict]:
         """Jump to the first step whose answer we don't have yet."""
         c = s.ctx
-        if not c.get("from"):
-            return await self._ask_origin(s)
-        if not c.get("to"):
-            return await self._ask_dest(s)
-        if not c.get("date"):
-            return self._ask_date(s)
+        if not (c.get("from") and c.get("to") and c.get("date")):
+            if c.get("from") and not c.get("to") and not await self._db(self.repo.destinations_from, c["from"]):
+                airports = await self._db(self.repo.list_airports)
+                if len(airports) > 1:
+                    return await self._no_departures(s, airports)
+            return self._ask_trip(s)
+        if c["to"] not in await self._db(self.repo.destinations_from, c["from"]):  # no flight runs this route at all
+            return await self._no_route(s)
         return await self._show_results(s)
 
     async def _ask_dest(self, s: Session) -> list[dict]:
@@ -349,10 +435,7 @@ class FlightAgent(Agent):
     async def _on_city_text(self, s: Session, text: str) -> list[dict]:
         """"Another city…": the traveller typed a name. We can only fly where the airports table has an airport."""
         kind = s.ctx.get("city_for")
-        low = " ".join(text.lower().split())
-        code = CITY_ALIASES.get(low)
-        if not code and (m := city_pattern().search(low)):
-            code = CITY_ALIASES[m.group(1)]
+        code = find_city(text)
         served = {a["code"] for a in await self._db(self.repo.list_airports)}
         if not code or (kind == "from" and code not in served) or (kind == "to" and code == s.ctx.get("from")):
             return [text_msg(f"😕 I can't book flights for *{text[:40]}* yet. Try another city, or type *menu*.")]
@@ -564,22 +647,15 @@ class FlightAgent(Agent):
             return [buttons_msg("😕 Oh no, this flight is no longer available.",
                                 [("act:results", "↩️ Other flights"), ("nav:menu", "🏠 Menu")])]
         c = s.ctx
-        international = is_international(f["from_code"], f["to_code"])
-        if international and not c.get("citizen"):  # entry rules depend on the passport: ask before showing the flight
-            c["await_flight"] = flight_id
-            return self._ask_citizen(s, f)
         c["flight_id"] = flight_id
         dep = to_ist(f["departure_time"])
         c["flight_summary"] = (f"{f['flight_no']} · {city(f['from_code'])} ➜ {city(f['to_code'])}\n"
                                f"🛫 {dep:%a, %d %b} · {dep:%H:%M}")
         s.step = "awaiting_flight_action"
         seats = f"🔥 Only {f['seats_left']} seats left!" if f["seats_left"] <= 5 else f"💺 {f['seats_left']} seats available"
-        note, advice = await self._travel_note(s, f) if international else ("", None)
         buttons = [("act:book", "✅ Book Now"), ("act:results", "↩️ Other flights"), ("nav:menu", "🏠 Menu")]
-        if international and (advice is None or advice.needs_visa) and is_home_passport(c.get("citizen", "")):
-            c["pending_slots"] = {"country": visa_code_for(country_of(f["to_code"])), "to": f["to_code"]}
-            buttons[2] = ("svc:visa", "🛂 Visa help")
-        return [buttons_msg(f"{flight_card(f)}\n{seats}\n\n💰 *{inr(f['price_inr'])}* per person{note}", buttons)]
+        return [buttons_msg(f"{flight_card(f)}\n{seats}\n\n💰 *{inr(f['price_inr'])}* per person\n\n"
+                            "Tap *Book Now*, or just type the traveller name(s), like *Rahul, Priya*.", buttons)]
 
     # ------------------------------------------------------------- passport and visa
     def _ask_citizen(self, s: Session, f: dict) -> list[dict]:
@@ -614,53 +690,15 @@ class FlightAgent(Agent):
         return await self._idea_advice(s, c.pop("await_place"))
 
     async def trip_idea(self, s: Session, place: str) -> list[dict]:
-        """They want to go somewhere we have no airport for. Do the part we can still do well: the entry rules for
-        their passport first (it can take weeks), then offer a plan and the visa desk."""
+        """They want to go somewhere we have no airport for: say so honestly and offer the plan instead."""
         for k in TRIP_KEYS:
             s.ctx.pop(k, None)
-        s.ctx["await_place"] = place
-        if s.ctx.get("citizen"):
-            return await self._after_citizen(s)
-        s.step = "awaiting_citizen"
-        home = await self._home_country(s, await self._db(self.repo.list_airports))
-        return [buttons_msg(f"✨ *{place[:40]}*, great choice! Before anything, entry rules depend on your passport.\n\n"
-                            "Which passport will you travel on? I'll check if you need a visa.",
-                            [("cz:home", f"🛂 {home}"[:20]), ("cz:other", "🌍 Other passport")])]
-
-    async def _idea_advice(self, s: Session, place: str) -> list[dict]:
-        c, citizen = s.ctx, s.ctx["citizen"]
         found = await self.advisor.place_country(place) if self.advisor else None
         name, country = found or (place, "")
-        advice = await self.advisor.visa_check(citizen, country) if self.advisor and country else None
-        lines = [f"🌍 *{name}*" + (f", {country}" if country else "")]
-        if advice:
-            lines += [f"{advice.icon} *{advice.headline}* · {citizen} passport → {country}", advice.summary]
-        else:
-            lines.append("🛂 Entry rules depend on your passport. Please check the official visa site before you book.")
-        lines.append("📘 Passport should be valid 6+ months after your trip. Rules change, so confirm with the embassy.")
-        lines.append(f"\n✈️ I can't book flights to {name} yet, but I can plan the trip and sort the visa for you.")
-        code = visa_code_for(country) if country else None
-        buttons = [("svc:planner", "🗺️ Plan My Trip"), ("nav:menu", "🏠 Menu")]
-        if code and is_home_passport(citizen) and (advice is None or advice.needs_visa):
-            c["pending_slots"] = {"country": code}
-            buttons.insert(0, ("svc:visa", "🛂 Visa help"))
         s.step = "menu"
-        return [buttons_msg("\n".join(lines), buttons)]
-
-    async def _travel_note(self, s: Session, f: dict):
-        """The entry-rules paragraph for an international flight, and the advice behind it (None when we couldn't tell)."""
-        citizen, country = s.ctx["citizen"], country_of(f["to_code"])
-        advice = await self.advisor.visa_check(citizen, country) if self.advisor else None
-        s.ctx["visa_advice"] = {"to": f["to_code"], "needs": advice.needs_visa if advice else None,
-                                "status": advice.status if advice else "unknown"}
-        if advice:
-            note = f"\n\n{advice.icon} *{advice.headline}* · {citizen} passport → {country}\n{advice.summary}"
-        else:
-            note = f"\n\n🛂 *{country}* may need a visa for a {citizen} passport. Worth checking before you pay."
-        note += "\n📘 Passport should be valid 6+ months after your trip. Rules change, so confirm with the embassy."
-        if not is_home_passport(citizen) and (advice is None or advice.needs_visa):
-            note += "\nℹ️ My visa desk handles Indian passports for now; please apply on the official site."
-        return note + "\n(Wrong passport? Type *change passport*.)", advice
+        return [buttons_msg(f"🌍 *{name}*" + (f", {country}" if country else "") +
+                            f"\n\n✈️ I can't book flights to {name} yet, but I can plan the trip for you.",
+                            [("svc:planner", "🗺️ Plan My Trip"), ("nav:menu", "🏠 Menu")])]
 
     # ------------------------------------------------------------------------- booking
     async def _ask_travellers(self, s: Session) -> list[dict]:
@@ -668,30 +706,57 @@ class FlightAgent(Agent):
         if not f or f["status"] == "cancelled" or f["seats_left"] <= 0:
             return [buttons_msg("😕 Oh no, this flight is no longer available.",
                                 [("act:results", "↩️ Other flights"), ("nav:menu", "🏠 Menu")])]
-        top = min(f["seats_left"], 6)
         s.ctx["unit_price"] = f["price_inr"]
-        if top == 1:  # only one seat left, no need to ask
-            s.ctx["pax"], s.ctx["names"] = 1, []
-            return self._ask_passenger(s)
-        s.step = "awaiting_pax"
-        rows = [(f"pax:{n}", f"{n} traveller{'s' if n > 1 else ''}", f"{inr(f['price_inr'] * n)} total") for n in range(1, top + 1)]
-        return [list_msg("👥 *How many travellers?*", "Choose number", rows, "Travellers")]
+        s.ctx["pax"], s.ctx["names"] = min(s.ctx.get("pax_hint") or 1, f["seats_left"], 6), []
+        return self._ask_passenger(s)
 
     def _ask_passenger(self, s: Session) -> list[dict]:
-        s.step = "awaiting_passenger"
-        pax = s.ctx.get("pax", 1)
+        """Straight to the summary when it is one traveller and we know their name; otherwise one question for all names."""
+        c = s.ctx
         name = s.user.get("name")
-        if not name or name == "Unknown":
-            return self._prompt_name(s)
-        who = "Who's flying?" if pax == 1 else f"Let's add your {pax} travellers. Is *traveller 1* you?"
-        return [buttons_msg(f"👤 Great pick! {who}\nYour name: *{name}*",
-                            [("name:self", "For me"), ("name:other", "Someone else")])]
+        if c.get("pax", 1) == 1 and name and name != "Unknown" and not c.get("names"):
+            c["names"] = [name]
+        if len(c.get("names") or []) == c.get("pax", 1):
+            return self._confirm(s)
+        return self._prompt_name(s)
 
     def _prompt_name(self, s: Session) -> list[dict]:
         s.step = "awaiting_name"
-        n, pax = len(s.ctx.get("names") or []) + 1, s.ctx.get("pax", 1)
-        label = "the passenger's" if pax == 1 else f"traveller {n} of {pax}'s"
-        return [text_msg(f"✏️ Please type {label} full name (as on their ID).")]
+        pax = s.ctx.get("pax", 1)
+        who = "the passenger's full name" if pax == 1 else f"the full names of all {pax} travellers, separated by commas"
+        return [text_msg(f"✏️ Please type {who} (as on the ID).")]
+
+    def _set_names(self, s: Session, names: list[str]) -> list[dict]:
+        s.ctx["names"], s.ctx["pax"] = names, len(names)
+        return self._confirm(s)
+
+    def _parse_names(self, text: str, s: Session) -> list[str]:
+        """"Rahul, Priya" / "book for me and Priya" / "Rahul & Priya" -> clean names ("me" is the user). [] if it isn't names."""
+        t = re.sub(r"^(?:please\s+)?(?:book(?:\s+it)?|ticket|tickets)?\s*(?:for|ke liye)?\s+", "", text.strip(), flags=re.I) if re.match(r"(?i)\s*(?:please\s+)?(?:book|tickets?)\b", text) else text
+        parts = [p.strip() for p in re.split(r"\s*(?:,|&|\band\b|\+)\s*", t) if p.strip()]
+        names = []
+        for part in parts:
+            if part.lower() in ("me", "myself", "mere liye", "for me"):
+                if not s.user.get("name") or s.user["name"] == "Unknown":
+                    return []
+                names.append(s.user["name"])
+            elif NAME_PART.fullmatch(part) and part.lower() not in YES | NO:
+                names.append(" ".join(part.split()).title())
+            else:
+                return []
+        return names[:6]
+
+    async def _on_booking_text(self, s: Session, text: str) -> list[dict]:
+        """Typed words under a flight card: "book" (or a tap on Book Now), traveller names, or "other flights"."""
+        low = text.lower().strip()
+        if low in YES or re.fullmatch(r"book( it| now| this)?( for me)?", low):
+            return await self._on_reply(s, "act:book")
+        if re.search(r"\b(other|another|more|different|back)\b.*\b(flights?|options?)\b|\bflights?\b.*\b(other|another|more)\b", low):
+            return await self._show_results(s)
+        if names := self._parse_names(text, s):
+            await self._ask_travellers(s)
+            return self._set_names(s, names)
+        return [text_msg("👍 Tap *Book Now*, or type the traveller name(s), like *Rahul, Priya*.")]
 
     def _next_name_or_confirm(self, s: Session) -> list[dict]:
         return self._prompt_name(s) if len(s.ctx["names"]) < s.ctx.get("pax", 1) else self._confirm(s)
@@ -699,10 +764,15 @@ class FlightAgent(Agent):
     def _on_name_text(self, s: Session, text: str) -> list[dict]:
         if not s.ctx.get("flight_id"):
             return self._menu(s, greet=True)
-        if not re.fullmatch(r"[A-Za-z][A-Za-z .'\-]{1,59}", text):
-            return [text_msg("😕 Please use letters only for the name (2-60 characters).")]
-        s.ctx.setdefault("names", []).append(" ".join(text.split()).title())
-        return self._next_name_or_confirm(s)
+        if not (names := self._parse_names(text, s)):
+            return [text_msg("😕 Please use letters only for the names (2-60 characters each), separated by commas.")]
+        pax = s.ctx.get("pax", 1)
+        if len(names) < pax and pax > 1 and len(names) == 1 and s.ctx.get("names"):  # one more name at a time still works
+            s.ctx["names"] = s.ctx["names"] + names
+            return self._next_name_or_confirm(s)
+        if len(names) < pax:
+            return [text_msg(f"😕 I need {pax} names, separated by commas. You gave {len(names)}.")]
+        return self._set_names(s, names)
 
     def _confirm(self, s: Session) -> list[dict]:
         s.step = "awaiting_confirm"
@@ -717,20 +787,46 @@ class FlightAgent(Agent):
     async def _do_booking(self, s: Session) -> list[dict]:
         f = await self._db(self.repo.get_flight, s.ctx["flight_id"])
         names, pax = s.ctx["names"], s.ctx.get("pax", 1)
-        pay_online = self.payments is not None and self.payments.enabled
-        booking = (await self._db(self.repo.create_booking, s.user["id"], f, ", ".join(names), pax,
-                                  "pending" if pay_online else "confirmed") if f else None)
+        if self.checkout is not None and self.checkout.online:  # paid online: into the bundle, held only at checkout
+            if not f or f["status"] == "cancelled" or f["seats_left"] < pax:
+                s.step = "awaiting_flight"
+                return [buttons_msg("😕 Sorry, there aren't enough seats left on this flight. Want to see other flights?",
+                                    [("act:results", "↩️ Other flights"), ("nav:menu", "🏠 Menu")])]
+            item = {"kind": "flight", "flight_id": f["id"], "names": names, "pax": pax, "amount": f["price_inr"] * pax,
+                    "label": f"✈️ {f['flight_no']} {city(f['from_code'])} ➜ {city(f['to_code'])}, {to_ist(f['departure_time']):%a %d %b}"}
+            for k in ("flight_id", "passenger_name", "flight_summary", "pax", "names", "unit_price"):
+                s.ctx.pop(k, None)
+            s.ctx["trip"] = self._trip_from(f) | ({"return_date": s.ctx["return_date"]} if s.ctx.get("return_date") else {})
+            return await self.checkout.add(s, item, {"to": f["to_code"], "date": to_ist(f["arrival_time"]).date().isoformat()})
+        booking = (await self._db(self.repo.create_booking, s.user["id"], f, ", ".join(names), pax, "confirmed") if f else None)
         if not booking:
             s.step = "awaiting_flight"
             return [buttons_msg("😕 Sorry, there aren't enough seats left on this flight. Want to see other flights?",
                                 [("act:results", "↩️ Other flights"), ("nav:menu", "🏠 Menu")])]
         for k in ("flight_id", "passenger_name", "flight_summary", "pax", "names", "unit_price"):
             s.ctx.pop(k, None)
-        if pay_online:
-            return await self._request_payment(s, booking, f, names)
         s.ctx["trip"] = self._trip_from(f)
         s.step = "menu"
         return self._ticket(booking, f, s.ctx, s.msg_id, await city_tip(self.advisor, f["to_code"], "Have a wonderful trip!"))
+
+    # ---- what the Checkout asks of a bundleable service
+    async def create_pending(self, s: Session, item: dict) -> dict | None:
+        f = await self._db(self.repo.get_flight, item["flight_id"])
+        return await self._db(self.repo.create_booking, s.user["id"], f, ", ".join(item["names"]), item["pax"], "pending") if f else None
+
+    async def attach_payment(self, s: Session, booking: dict, link: dict, expires_at: datetime) -> None:
+        await self._db(self.repo.create_payment, booking["id"], s.user["id"], booking["total_price_inr"], link["id"],
+                       link["short_url"], expires_at)
+
+    async def release_booking(self, booking_id: str) -> None:
+        b = await self._db(self.repo.get_booking_with_user, booking_id)
+        if b:
+            await self._db(self.repo.cancel_payment, b["id"])
+            await self._db(self.repo.cancel_booking, b)
+
+    async def booking_state(self, booking_id: str) -> str | None:
+        b = await self._db(self.repo.get_booking_with_user, booking_id)
+        return b["status"] if b else None
 
     # ---------------------------------------------------------------------- payment
     @staticmethod
@@ -750,19 +846,25 @@ class FlightAgent(Agent):
                   f"{flight_card(f)}\n━━━━━━━━━━━━━━━\n💰 Total: *{inr(booking['total_price_inr'])}*"
                   + (f" ({pax} travellers)" if pax > 1 else ""))
         trip = self._trip_from(f)
-        visa = ctx.get("visa_advice")
-        visa = visa if visa and visa.get("to") == f["to_code"] else None
+        if ctx.get("return_date"):
+            trip["return_date"] = ctx["return_date"]
+            if isinstance(ctx.get("trip"), dict):
+                ctx["trip"]["return_date"] = ctx["return_date"]
+        visa = None  # visa is only discussed when the traveller asks for it
         queue = [x for x in ctx.get("queue") or [] if x in NEXT_STEPS]  # services the user also asked for
-        steps = suggest_steps(trip, queue, visa)
+        bundled = tuple(ctx.get("bundle_kinds") or ())  # paid together with this ticket: not offered again
+        steps = suggest_steps(trip, queue, done=bundled)
         if queue:
             ask = f"\n\nYou also mentioned {NEXT_STEPS[queue[0]][1]}. Shall we do that next?"
+        elif "hotel" in bundled:  # the stay's voucher follows right after this ticket and asks what is next
+            ask = ""
         else:
             pitch = [PITCH[x].format(city=trip["city"]) for x in steps[:3]]
-            ask = f"\n\nNext, I can help with {', '.join(pitch[:-1])} or {pitch[-1]}."
+            listed = pitch[0] if len(pitch) == 1 else f"{', '.join(pitch[:-1])} or {pitch[-1]}"
+            ask = f"\n\nWant me to arrange {listed}, or anything else to make your trip comfortable?"
         heads_up = ""
-        if trip["intl"] and (visa is None or visa.get("needs")):
-            heads_up = (f"\n\n🛂 *Heads up:* {trip['country']} needs a visa check for your passport. "
-                        "Visas take time, so it's best to start today.")
+        if trip.get("return_date"):
+            heads_up += f"\n\n↩️ You're coming back on *{date.fromisoformat(trip['return_date']):%a, %d %b}*. Tap *Return Flight* and I'll find flights for that day."
         buttons = [(f"svc:{x}", NEXT_STEPS[x][0]) for x in steps[:2]] + [("act:return", "↩️ Return Flight")]
         out = [text_msg(ticket),
                buttons_msg(f"{countdown(to_ist(f['departure_time']))}{heads_up}\n\n💡 *{city(f['to_code'])} tip:* {tip}{ask}", buttons)]
@@ -828,7 +930,7 @@ class FlightAgent(Agent):
             return [buttons_msg("I haven't received the payment yet. If you've just paid, give it a few seconds and tap again. 🙏",
                                 [("pay:check", "✅ I've paid"), ("pay:cancel", "❌ Cancel booking")])]
         s.ctx.pop("pay", None)
-        s.ctx["trip"] = self._trip_from(confirmed["flights"])
+        s.ctx["trip"] = self._trip_from(confirmed["flights"]) | ({"return_date": s.ctx["return_date"]} if s.ctx.get("return_date") else {})
         s.step = "menu"
         tip = await city_tip(self.advisor, confirmed["flights"]["to_code"], "Have a wonderful trip!")
         return self._ticket(confirmed, confirmed["flights"], s.ctx, s.msg_id, tip)
@@ -841,7 +943,7 @@ class FlightAgent(Agent):
         phone = b["users"]["phone"]
         convo = await self._db(self.repo.get_conversation, phone)
         ctx = dict((convo or {}).get("context") or {})
-        ctx["trip"] = self._trip_from(b["flights"])  # (keep ctx["pay"]: a late "I've paid" tap then gets a friendly answer)
+        ctx["trip"] = self._trip_from(b["flights"]) | ({"return_date": ctx["return_date"]} if ctx.get("return_date") else {})  # (keep ctx["pay"]: a late "I've paid" tap then gets a friendly answer)
         await self._db(self.repo.save_conversation, phone, "menu", ctx)
         tip = await city_tip(self.advisor, b["flights"]["to_code"], "Have a wonderful trip!")
         return phone.lstrip("+"), self._ticket(b, b["flights"], ctx, None, tip)

@@ -6,13 +6,16 @@ the Session context (e.g. `ctx["trip"]`) which the Concierge persists between me
 """
 import asyncio
 import logging
+import re
 
 from app.agents.base import Agent, Session
-from app.agents.concierge.classifiers import Intent
+from app.agents.checkout import CheckoutAgent
+from app.agents.concierge.classifiers import PATTERNS, Intent
 from app.agents.concierge.router import IntentRouter
 from app.core.messages import buttons_msg, list_msg, text_msg
 from app.core.geo import fresh_location, save_location
 from app.core.places import city, example_route
+from app.core.lang import update_language
 from app.core.safety import CRISIS_MESSAGE, is_crisis
 from app.core.utils import day_greeting, normalize_phone, now_ist
 
@@ -23,10 +26,16 @@ HISTORY_LIMIT = 4  # enough for "yes" / "that one"; more makes the model re-queu
 
 
 class Concierge:
-    def __init__(self, repo, agents: list[Agent], router: IntentRouter):
+    def __init__(self, repo, agents: list[Agent], router: IntentRouter, gateway=None):
         self.repo = repo
+        gateway = gateway or next((a.payments for a in agents if getattr(a, "payments", None) is not None), None)
+        self.checkout = CheckoutAgent(gateway)
+        agents = [*agents, self.checkout]
         self.agents = {a.name: a for a in agents}
         self.by_kind = {kind: a for a in agents for kind in a.owns}
+        self.checkout.agents = self.agents
+        for a in agents:
+            a.checkout = self.checkout
         self.router = router
 
     async def _db(self, fn, *args):
@@ -47,6 +56,8 @@ class Concierge:
         if ctx.get("loc") and not fresh_location(ctx):
             ctx.pop("loc")  # a shared location is only kept for a few hours
 
+        if text and not reply_id:
+            update_language(ctx, text)  # answer in the language they write: English unless Hinglish
         user = await self._db(self.repo.get_or_create_user, phone, profile_name)
         s = Session(phone, user, (convo or {}).get("current_step", "start"), msg_id, ctx)
 
@@ -89,15 +100,18 @@ class Concierge:
             if agent.accepts_media(media):
                 s.ctx["agent"] = agent.name
                 return await agent.on_media(s, media, caption)
-        return self._main_menu(s, note="Thanks! I can't use files at the moment, but you can start a visa application "
-                                       "from the menu and send your documents there. 📎")
+        return self._main_menu(s, note="Thanks! I can't use files at the moment. Just type what you need and I'll take it from there. 📎")
 
     async def confirm_payment(self, link_id: str) -> tuple[str, list[dict]] | None:
-        """Razorpay webhook: ask each agent that takes payments whether this link is theirs."""
-        for agent in self.agents.values():
-            if hasattr(agent, "confirm_payment") and (result := await agent.confirm_payment(link_id)):
-                return result
-        return None
+        """Razorpay webhook: one link can pay several bookings (a flight and a hotel); each service confirms its own."""
+        result = await self.checkout.confirm_payment_all(self.agents, link_id)
+        if result:  # the bundle is paid: forget the checkout so the next trip starts clean
+            phone = "+" + result[0].lstrip("+")
+            convo = await self._db(self.repo.get_conversation, phone)
+            ctx = dict((convo or {}).get("context") or {})
+            if ctx.pop("checkout", None) is not None or ctx.pop("cart", None) is not None:
+                await self._db(self.repo.save_conversation, phone, (convo or {}).get("current_step", "menu"), ctx)
+        return result
 
     async def release_expired(self) -> list[tuple[str, list[dict]]]:
         """Sweeper: every agent that holds inventory for unpaid bookings releases the ones past their window."""
@@ -180,12 +194,15 @@ class Concierge:
             s.ctx["queue"], s.ctx["agent"] = [], "flight"
             return await self.agents["flight"].trip_idea(s, place)
 
-        wanted = [n for n in dict.fromkeys([intent.name, *intent.also]) if n in self.agents]
+        # Only queue extra services the user actually named: a model guessing "hotel" after "show me flights" is unwanted.
+        # What comes next is offered after the booking is paid.
+        also = [n for n in intent.also if not text or re.search(PATTERNS.get(n, "(?!x)x"), text.lower())]
+        wanted = [n for n in dict.fromkeys([intent.name, *also]) if n in self.agents]
         if wanted:
             wanted.sort(key=lambda n: not self._is_live(n))  # stable: what we can actually do now goes first
             first, rest = wanted[0], wanted[1:]
             s.ctx["queue"], s.ctx["agent"] = rest, first
-            out = await self.agents[first].start(s, intent.slots)
+            out = await self.agents[first].start(s, {**intent.slots, "text": text} if text else intent.slots)
             if rest:
                 later = " and ".join(self.agents[n].title.lower() for n in rest)
                 out.insert(0, text_msg(f"Got it! Let's start with {self.agents[first].title.lower()}, "
@@ -231,14 +248,13 @@ class Concierge:
             s.ctx.pop(key, None)
         for agent in self.agents.values():
             agent.reset(s)
-        if greet:
+        if greet:  # two short texts, no menu to scroll: the traveller just says what they need
             first = (s.user.get("name") or "").split(" ")[0]
             first = first if first and first != "Unknown" else "there"
-            body = (f"{day_greeting()}, {first}! 👋\nI'm your travel concierge: flights, stays, cabs, trip plans, events, visa & forex "
-                    "in one chat ⚡\n\nWhat do you need today? Pick below, or just type it, "
-                    f"like *{example_route()} tomorrow*.")
-        else:
-            body = note or "What do you need next? 👇"
+            return [text_msg(f"{day_greeting()}, {first}! 👋 I'll help you with your complete trip planning: flights, hotels, "
+                             "cabs and everything else you need, all in this chat."),
+                    text_msg(f"Let me know what you'd like to do. Just type it, like *{example_route()}, 12 Oct, round trip*. ✈️")]
+        body = note or "What do you need next? 👇"
         rows = [(f"svc:{a.name}", f"{a.emoji} {a.title}", a.menu_desc) for a in self.agents.values() if a.in_menu]
         rows.append(("menu:bookings", "📋 My Bookings", "Your flights & trips"))
         return [list_msg(body, "Choose service", rows, "Services")]

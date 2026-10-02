@@ -66,6 +66,9 @@ Seed only the hotel data, leaving flights and real bookings untouched:
 ```
 python supabase/seed/seed_dummy_data.py --hotels-only
 ```
+Run `migrations/20261012000000_hotel_images.sql` too if you want to give a hotel its own photo: set `hotels.image_url` to a public
+https link (JPG or PNG, up to 5 MB). Hotels without one show a stock photo, so the column is optional.
+
 This creates 44 invented hotels (4 per city, 11 cities), 124 rooms (Standard / Deluxe / Suite, no Suite in 2-star hotels) and 4 sample
 stays. The full seed includes it too. It stops with an error if a real stay still references a hotel, so real bookings are never deleted.
 

@@ -168,3 +168,76 @@ def test_trip_facts_for_the_model():
     assert "No upcoming flight" in T.describe(now, [], None, None, None, None).text
     assert "not shared" in T.describe(now, [], None, None, None, None).text
     assert T.fmt_delta(timedelta(minutes=80)) == "in 1h 20m" and T.fmt_delta(timedelta(minutes=-25)) == "25m ago"
+
+
+# ------------------------------------------------------------------------- photos in messages
+def _capture(monkeypatch, fail_when=lambda payload: False, uploadable=lambda url: True):
+    sent = []
+
+    async def fake_post(to, body):
+        sent.append(body)
+        return not fail_when(body)
+
+    async def fake_media_id(url):
+        return "media-" + url.rsplit("/", 1)[-1] if uploadable(url) else None
+
+    monkeypatch.setattr(WhatsAppService, "_post", staticmethod(fake_post))
+    monkeypatch.setattr(WhatsAppService, "_media_id", staticmethod(fake_media_id))
+    return sent
+
+
+def test_image_message_goes_out_as_an_uploaded_photo_with_its_caption(monkeypatch):
+    sent = _capture(monkeypatch)
+    asyncio.run(WhatsAppService.send("91987", {"type": "image", "url": "https://x.test/a.jpg", "body": "Nice hotel"}))
+    assert sent == [{"type": "image", "image": {"id": "media-a.jpg", "caption": "Nice hotel"}}]
+
+
+def test_buttons_and_cta_carry_the_photo_as_a_header(monkeypatch):
+    sent = _capture(monkeypatch)
+    asyncio.run(WhatsAppService.send("91987", {"type": "buttons", "body": "Hi", "buttons": [("a", "A")], "image": "https://x.test/a.jpg"}))
+    asyncio.run(WhatsAppService.send("91987", {"type": "cta", "body": "Pay", "button_text": "Pay", "url": "https://p.test", "image": "https://x.test/a.jpg"}))
+    for payload in sent:
+        assert payload["interactive"]["header"] == {"type": "image", "image": {"id": "media-a.jpg"}}
+    asyncio.run(WhatsAppService.send("91987", {"type": "buttons", "body": "Hi", "buttons": [("a", "A")]}))
+    assert "header" not in sent[-1]["interactive"]
+
+
+def test_a_photo_that_cannot_be_uploaded_never_costs_the_user_the_message(monkeypatch):
+    sent = _capture(monkeypatch, uploadable=lambda url: False)
+    asyncio.run(WhatsAppService.send("91987", {"type": "image", "url": "https://dead.test/a.jpg", "body": "Hotel card"}))
+    asyncio.run(WhatsAppService.send("91987", {"type": "buttons", "body": "Your stay", "buttons": [("a", "A")], "image": "https://dead.test/a.jpg"}))
+    assert sent[0] == {"type": "text", "text": {"body": "Hotel card"}}
+    assert sent[1]["interactive"]["type"] == "button" and "header" not in sent[1]["interactive"]
+
+
+def test_the_photo_is_uploaded_to_whatsapp_once_and_reused(monkeypatch):
+    import httpx
+    from app.services import whatsapp_service as ws
+    from app.core.config import settings
+    ws._media_ids.clear()
+    monkeypatch.setattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "123")
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(200, content=b"JPEGDATA", headers={"content-type": "image/jpeg"})
+        return httpx.Response(200, json={"id": "MEDIA1"})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ws.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    assert asyncio.run(WhatsAppService._media_id("https://x.test/h.jpg")) == "MEDIA1"
+    assert asyncio.run(WhatsAppService._media_id("https://x.test/h.jpg")) == "MEDIA1"
+    assert calls == [("GET", "/h.jpg"), ("POST", "/v19.0/123/media")]
+
+
+def test_something_that_is_not_a_photo_is_not_uploaded(monkeypatch):
+    import httpx
+    from app.services import whatsapp_service as ws
+    from app.core.config import settings
+    ws._media_ids.clear()
+    monkeypatch.setattr(settings, "WHATSAPP_PHONE_NUMBER_ID", "123")
+    real = httpx.AsyncClient
+    html = lambda request: httpx.Response(200, content=b"<html>", headers={"content-type": "text/html"})
+    monkeypatch.setattr(ws.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(html), **kw))
+    assert asyncio.run(WhatsAppService._media_id("https://x.test/blocked")) is None

@@ -42,7 +42,7 @@ def test_chat_continues_and_buddy_sees_the_conversation():
 
 def test_buddy_is_in_the_menu_and_can_be_opened():
     c, _ = chat()
-    c.send("hi")
+    c.send("hi"); c.send(reply_id="nav:menu")
     assert c.ids()[-2:] == ["svc:buddy", "menu:bookings"]
     assert "Buddy" in c.send(reply_id="svc:buddy")["body"]
     assert c.repo.convos["+919876543210"]["current_step"] == "buddy_chat"
@@ -80,7 +80,8 @@ def test_suggestions_become_buttons_that_open_the_service():
     brain.queue.append(BuddyReply("Thoda ghoom aao yaar!", suggest=["flight", "hotel"]))
     out = c.send("bahut stress hai, kuch samajh nahi aa raha")
     assert out["type"] == "buttons" and [i for i, _ in out["buttons"]] == ["svc:flight", "svc:hotel"]
-    assert "from:loc" in [r[0] for r in c.send(reply_id="svc:flight")["rows"]]  # straight to the route, no menu
+    out = c.send(reply_id="svc:flight")
+    assert out["type"] == "text" and "Tell me where you're flying from" in out["body"]  # straight to one plain question, no menu
 
 
 def test_asking_for_a_service_mid_chat_switches_topic():

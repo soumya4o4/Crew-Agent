@@ -163,7 +163,7 @@ class FlightRepo(CoreRepo):
         expired = []
         for p in due:
             if not self.db.table("payments").update({"status": "expired"}).eq("link_id", p["link_id"]) \
-                    .eq("status", "created").execute().data:
+                    .eq("kind", "flight").eq("status", "created").execute().data:
                 continue  # paid or cancelled a moment ago
             booking = self.get_booking_with_user(p["booking_id"])
             if booking and booking["status"] == "pending":

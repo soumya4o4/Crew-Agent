@@ -28,6 +28,8 @@ class Agent:
     menu_desc: str = ""
     in_menu: bool = True  # False: not a row in the main menu (still reachable by text, buttons and shared files)
     owns: frozenset[str] = frozenset()
+    bundleable: bool = False   # True: its bookings can be paid together with others through the CheckoutAgent
+    checkout = None            # the CheckoutAgent, set by the Concierge
 
     def reset(self, s: Session) -> None:
         """Forget any half-finished work (called when the user returns to the main menu)."""

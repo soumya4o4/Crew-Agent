@@ -18,7 +18,8 @@ from app.agents.buddy import trip as T
 from app.agents.buddy.brain import SERVICES, MAX_SUGGEST
 from app.agents.buddy.needs import next_needs
 from app.core import safety
-from app.core.geo import fresh_location, maps_link
+from app.core.lang import language_name
+from app.core.geo import fresh_location, location_age_min, maps_link
 from app.core.messages import buttons_msg, cta_msg, location_request_msg, text_msg
 from app.core.places import AIRPORT_COORDS, city
 from app.core.utils import now_ist
@@ -34,6 +35,12 @@ FORGET = re.compile(r"\b(forget me|forget everything|delete (?:all )?my (?:data|
                     r"(?:delete|clear|hata)\w*|sab (?:kuch )?bhool ja\w*)\b")
 SHOW = re.compile(r"\b(what do you (?:remember|know) about me|kya yaad hai|mere baare mein kya (?:pata|yaad|jaante)|"
                   r"show my memor(?:y|ies))\b")
+# "where am I?": answered from the pin they shared, never guessed
+WHERE_AM_I = re.compile(r"\b(where am i|where are we|what(?:'s| is) my (?:current |live )?location|tell me my (?:current )?location|"
+                        r"(?:main|mai|mein|me) kaha?n? (?:hu+n?|hoon|hun)|meri (?:current |live )?location (?:kya|kaun|bata\w*|dikha\w*)|"
+                        r"(?:mera|meri) (?:current |live )?(?:location|jagah) (?:kya|kaun) ?\w*|current location (?:kya|bata\w*)|"
+                        r"kaun si jagah (?:hu+n?|hoon))\b")
+FRESH_PIN_MIN = 10  # an older pin may be out of date: say where they were, and offer to refresh it
 # a "place" that is really something to attend: it belongs to the events agent, not a map search
 EVENTISH = re.compile(r"\b(events?|shows?|concerts?|festivals?|gigs?|things to do|activit\w*|exciting|fun|entertainment|happening)\b")
 # "book a flight to Goa" is a request for a service; "flight mein kitna time hai?" is a question for Buddy
@@ -67,7 +74,7 @@ class BuddyAgent(Agent):
     def claims(self, text: str) -> bool:
         """"forget me" and "what do you remember about me" work from anywhere in the bot."""
         low = text.lower()
-        return bool(FORGET.search(low) or SHOW.search(low))
+        return bool(FORGET.search(low) or SHOW.search(low) or WHERE_AM_I.search(low))
 
     def expects_text(self, s: Session) -> bool:
         return s.step in ("buddy_chat", "buddy_wait_location")
@@ -110,13 +117,39 @@ class BuddyAgent(Agent):
             return self._ask_forget()
         if SHOW.search(low):
             return await self._show_memories(s)
+        if WHERE_AM_I.search(low):
+            return await self._where_am_i(s)
         return await self._chat(s, text)
 
     async def on_location(self, s: Session, loc: dict) -> list[dict]:
         """The user shared a pin after we asked: carry on the conversation, now with their location in the facts."""
         s.ctx["agent"], s.step = "buddy", "buddy_chat"
-        s.ctx.pop("buddy_pending", None)
+        if s.ctx.pop("buddy_pending", None) == "where_am_i":
+            return await self._where_am_i(s)
         return await self._chat(s, "(I just shared my location)")
+
+    async def _label(self, loc: dict) -> str | None:
+        """A short name for where a pin is: what WhatsApp gave us, else a street and town from the coordinates."""
+        label = loc.get("label") or loc.get("name") or (loc.get("address") or "").split(",")[0] or None
+        if not label and self.geo:
+            label = await self.geo.reverse(loc["lat"], loc["lon"])
+            loc["label"] = label or ""
+        return label or None
+
+    async def _where_am_i(self, s: Session) -> list[dict]:
+        """Tell the user where their shared pin is. We never see a live location: a pin is where they were when they shared it."""
+        loc = fresh_location(s.ctx)
+        if not loc:
+            return self._ask_location(s, "where_am_i", "Main tumhari live location khud nahi dekh sakta. Pin share karo, phir bata dunga tum kahan ho.")
+        label = await self._label(loc)
+        age = location_age_min(loc)
+        where = f"*{label}* ke paas" if label else f"coordinates {loc['lat']:.4f}, {loc['lon']:.4f} par"
+        when = "abhi" if age < 2 else f"{age} min pehle"
+        out = [cta_msg(f"📍 Tumne {when} jo pin bheja tha, uske hisaab se tum {where} ho.", "🗺️ Open in Maps",
+                       f"https://www.google.com/maps?q={loc['lat']},{loc['lon']}")]
+        if age >= FRESH_PIN_MIN:
+            out += self._ask_location(s, "where_am_i", "Agar tum kahin aur chale gaye ho, to naya pin share karo, main update kar dunga.")
+        return out
 
     # --------------------------------------------------------------------- trip facts
     async def _trip(self, s: Session) -> T.TripInfo:
@@ -130,10 +163,7 @@ class BuddyAgent(Agent):
         loc = fresh_location(s.ctx)
         label = route = None
         if loc:
-            label = loc.get("label") or loc.get("name") or (loc.get("address") or "").split(",")[0] or None
-            if not label and self.geo:
-                label = await self.geo.reverse(loc["lat"], loc["lon"])
-                loc["label"] = label or ""
+            label = await self._label(loc)
             nxt = T.pick_next_flight(bookings, now_ist())
             if nxt and self.geo and nxt["flights"]["from_code"] in AIRPORT_COORDS and T.to_ist(nxt["flights"]["departure_time"]) > now_ist():
                 route = await self.geo.route((loc["lat"], loc["lon"]), AIRPORT_COORDS[nxt["flights"]["from_code"]])
@@ -166,7 +196,7 @@ class BuddyAgent(Agent):
         try:
             r = await asyncio.wait_for(self.brain.respond(
                 name=self._first_name(s), today=now_ist().date(), memories=memories, history=history, text=text,
-                trip=s.ctx.get("trip"), context=trip.text), LLM_TIMEOUT_S)
+                trip=s.ctx.get("trip"), context=trip.text, language=language_name(s.ctx)), LLM_TIMEOUT_S)
         except Exception:
             logger.exception("Buddy could not answer")
             return [text_msg(FALLBACK)]

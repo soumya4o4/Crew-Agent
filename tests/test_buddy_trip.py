@@ -90,7 +90,7 @@ def test_the_way_to_the_hotel_works_from_the_phones_own_gps():
 def test_buddy_can_ask_for_the_location_itself():
     c, brain = booked_chat()
     brain.queue.append(BuddyReply("Ruko, location bhej do.", action="ask_location"))
-    c.send("pata nahi main kahan hoon")
+    c.send("raasta bhatak gaya yaar")
     assert c.last[1]["type"] == "location_request"
     c.send_location()
     assert brain.calls[-1]["text"] == "(I just shared my location)"
@@ -172,3 +172,41 @@ def test_no_payments_says_so():
     c = Chat(brain=brain)
     c.send("kitna spend hua?")
     assert "no paid transactions yet" in brain.calls[0]["context"]
+
+
+# ------------------------------------------------------------------------ where am I
+def test_where_am_i_without_a_pin_asks_for_one_and_then_names_the_place():
+    c, brain = booked_chat()
+    assert c.send("where am i")["type"] == "location_request" and brain.calls == []
+    out = c.send_location()
+    assert out["type"] == "cta" and "Martand Chowk, Indore" in out["body"] and "abhi" in out["body"]
+    assert "google.com/maps?q=22.7196,75.8577" in out["url"] and brain.calls == []  # answered by the app, not the model
+
+
+def test_where_am_i_in_hinglish_uses_a_pin_shared_earlier():
+    c, brain = booked_chat()
+    c.send_location()
+    for words in ("meri location kya hai", "main kahan hu", "mai kaha hoon"):
+        out = c.send(words)
+        assert out["type"] == "cta" and "Martand Chowk, Indore" in out["body"], words
+    assert brain.calls == []
+
+
+def test_an_old_pin_is_reported_as_old_and_a_fresh_one_is_offered():
+    from datetime import timedelta
+    from app.core.utils import now_ist
+    c, brain = booked_chat()
+    c.send_location()
+    for key in ("loc",):  # the pin was shared 40 minutes ago, still inside the 3 hour window
+        convo = c.repo.convos[next(iter(c.repo.convos))]
+        convo["context"][key]["at"] = (now_ist() - timedelta(minutes=40)).isoformat()
+    c.send("where am i")
+    assert "40 min pehle" in c.last[0]["body"] and c.last[1]["type"] == "location_request"
+    out = c.send_location(19.07, 72.87)  # they moved: the new pin replaces the old one
+    assert out["type"] == "cta" and "abhi" in out["body"] and "q=19.07,72.87" in out["url"]
+
+
+def test_where_am_i_works_in_the_middle_of_another_flow():
+    c, brain = booked_chat()
+    c.send(reply_id="svc:hotel"); c.send(reply_id="hotel:find")
+    assert c.send("where am i")["type"] == "location_request"

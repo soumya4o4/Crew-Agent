@@ -1,4 +1,5 @@
 """Hotel-specific text formatting: hotel cards, list rows, the stay voucher, the cancellation policy."""
+import re
 from datetime import date, datetime, timedelta
 
 from app.core.places import city
@@ -37,6 +38,31 @@ def hotel_card(h: dict) -> str:
     if h.get("description"):
         lines.append(f"_{h['description']}_")
     return "\n".join(lines)
+
+
+# what people type -> the amenity name used in our data
+AMENITY_WORDS = {"pool": "Pool", "swimming": "Pool", "gym": "Gym", "wifi": "Free WiFi", "wi-fi": "Free WiFi", "internet": "Free WiFi",
+                 "breakfast": "Breakfast included", "nashta": "Breakfast included", "parking": "Parking", "spa": "Spa",
+                 "restaurant": "Restaurant", "bar": "Bar", "shuttle": "Airport shuttle"}
+_AMENITY_WORD = re.compile(r"\b(" + "|".join(re.escape(w) for w in AMENITY_WORDS) + r")\b")
+_AMENITY_ASK = re.compile(r"\b(amenit\w*|facilit\w*|suvidha\w*|kya kya|inclusions?|what(?:'s| is| all)? (?:included|available|there))\b")
+
+
+def amenities_asked(text: str) -> list[str]:
+    """The amenities named in a message ("pool hai?", "gym and wifi"), as they appear in our data."""
+    return list(dict.fromkeys(AMENITY_WORDS[w] for w in _AMENITY_WORD.findall(text.lower())))
+
+
+def asks_amenities(text: str) -> bool:
+    return bool(amenities_asked(text) or _AMENITY_ASK.search(text.lower()))
+
+
+def amenity_answer(h: dict, asked: list[str]) -> str:
+    """What this hotel has: a yes or no for each thing asked about, then everything it offers."""
+    have = h.get("amenities") or []
+    lines = [f"{'✅ Yes' if a in have else '❌ No'}, *{h['name']}* {'has' if a in have else 'does not have'} {a.lower()}." for a in asked]
+    everything = " · ".join(have) if have else "no extra amenities listed"
+    return "\n".join(lines + [f"✨ *{h['name']}* offers: {everything}."])
 
 
 def hotel_tags(hotels: list[dict]) -> dict[str, list[str]]:

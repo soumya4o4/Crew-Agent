@@ -127,7 +127,7 @@ def test_newcomer_talk_about_travel_goes_to_the_guide_but_a_mood_does_not():
 
 def test_the_menu_starts_with_the_guide_and_it_opens_with_a_friendly_intro():
     c = Chat()
-    c.send("hi")
+    c.send("hi"); c.send(reply_id="nav:menu")
     assert c.ids()[0] == "svc:guide" and "svc:planner" not in c.ids()
     out = c.send(reply_id="svc:guide")
     assert "Trip Guide" in out["body"] and "getting back home" in out["body"] and c.ids() == ["guide:new", "svc:planner"]
@@ -314,3 +314,29 @@ def test_typing_a_bad_date_or_a_past_date_is_handled():
     assert "Type the date" in c.send(reply_id="gwhen:more")["body"]
     assert "couldn't read" in c.send("someday")["body"]
     assert "between tomorrow" in c.send((TODAY - timedelta(days=3)).strftime("%d/%m/%Y"))["body"]
+
+
+def test_typing_an_answer_instead_of_tapping_never_restarts_the_guide():
+    c = Chat(advisor=GuideAdvisor(VisaAdvice("on_arrival", "Pay at the airport.", 30),
+                                  ideas=[{"place": "Bali", "country": "Indonesia", "why": "Beaches.", "cost_inr": 85000, "entry": ""}]))
+    c.send("hi"); c.send(reply_id="svc:guide"); c.send(reply_id="guide:new"); c.send(reply_id="gpass:home"); c.send(reply_id="gkn:no")
+    out = c.send("50000")                                   # typed, not tapped
+    assert "Trip Guide" not in out["body"] and "kind of trip" in out["body"]
+    assert "How many days" in c.send("beach")["body"]
+    assert "Which month" in c.send("5 days")["body"]
+    assert "Ideas for you" in c.send("december")["body"]
+
+
+def test_one_message_can_answer_several_guide_questions():
+    c = Chat(advisor=GuideAdvisor(VisaAdvice("on_arrival", "Pay at the airport.", 30),
+                                  ideas=[{"place": "Bali", "country": "Indonesia", "why": "Beaches.", "cost_inr": 85000, "entry": ""}]))
+    c.send("hi"); c.send(reply_id="svc:guide"); c.send(reply_id="guide:new"); c.send(reply_id="gpass:home"); c.send(reply_id="gkn:no")
+    out = c.send("50000, 5 days, December, beach")           # budget, days, month and kind of trip in one go
+    assert "Ideas for you" in out["body"] and "Bali" in out["body"]
+    assert "start from" in c.send("1")["body"]               # typing the idea number works too
+
+
+def test_a_place_typed_when_asked_if_they_know_where_to_go_is_taken_as_the_place():
+    c = Chat()
+    c.send("hi"); c.send(reply_id="svc:guide"); c.send(reply_id="guide:new"); c.send(reply_id="gpass:home")
+    assert "start from" in c.send("Goa")["body"]

@@ -73,11 +73,10 @@ PITCH = {
 
 def suggest_steps(trip: dict, queue: list | None = None, visa: dict | None = None, done: tuple = ()) -> list[str]:
     """What this traveller most likely needs next, in order, worked out from the trip itself:
-    what they asked for, then a visa when the entry rules need action (or are unknown), then stay, transfers, money."""
+    what they asked for, then stay, transfers, money. Visa is never suggested: it only comes up when the traveller asks."""
     order = [x for x in queue or [] if x in NEXT_STEPS]
     if trip.get("intl"):
-        needs_visa = visa is None or visa.get("needs")  # no answer yet counts as "worth checking"
-        order += (["visa"] if needs_visa else []) + ["hotel", "forex", "cab"] + ([] if needs_visa else ["visa"])
+        order += ["hotel", "cab", "forex"]
     else:
         order += ["hotel", "cab"]
     order += ["events", "planner"]

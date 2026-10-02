@@ -52,73 +52,31 @@ def test_a_domestic_flight_never_asks_for_a_passport():
     assert "Try the dosa" in c.last[1]["body"] and "Heads up" not in c.last[1]["body"]
 
 
-def test_international_flight_asks_the_passport_then_shows_visa_advice():
+def test_an_international_flight_never_brings_up_the_visa_unasked():
     repo = FakeRepo()
     fid = add_dubai_flight(repo)
     advisor = FakeAdvisor(VisaAdvice("e_visa", "Apply online for a tourist e-visa.", 30))
     c = Chat(repo, advisor=advisor)
-    ask = open_dubai_flight(c, fid)
-    assert ask["type"] == "buttons" and "passport" in ask["body"] and [i for i, _ in ask["buttons"]] == ["cz:home", "cz:other"]
-    card = c.send(reply_id="cz:home")                                     # Mumbai flight: home country is India
-    assert advisor.calls == [("India", "United Arab Emirates")]
-    assert "e-Visa needed" in card["body"] and "Apply online" in card["body"] and "act:book" in c.ids()
-    assert "svc:visa" in c.ids()                                           # Indian passport + visa needed: offer our visa desk
-
-
-def test_other_passport_is_typed_and_remembered():
-    repo = FakeRepo()
-    fid = add_dubai_flight(repo)
-    advisor = FakeAdvisor(VisaAdvice("not_required", "Visa-free for 30 days.", 30))
-    c = Chat(repo, advisor=advisor)
-    open_dubai_flight(c, fid)
-    assert "Type your passport country" in c.send(reply_id="cz:other")["body"]
-    card = c.send("nepal")
-    assert advisor.calls == [("Nepal", "United Arab Emirates")] and "No visa needed" in card["body"]
-    assert "svc:visa" not in c.ids()                                       # nothing to apply for
-    c.send(reply_id="nav:menu"); c.send(reply_id="svc:flight")
-    assert c.send(reply_id=f"flt:{fid}")["type"] == "buttons" and len(advisor.calls) == 2  # not asked again
-
-
-def test_foreign_passport_gets_advice_but_no_visa_desk():
-    repo = FakeRepo()
-    fid = add_dubai_flight(repo)
-    c = Chat(repo, advisor=FakeAdvisor(VisaAdvice("required", "Apply at the embassy.", None)))
-    open_dubai_flight(c, fid)
-    c.send(reply_id="cz:other")
-    card = c.send("Pakistan")
-    assert "Indian passports for now" in card["body"] and "svc:visa" not in c.ids()
-
-
-def test_without_an_advisor_it_still_warns_and_points_to_the_visa_desk():
-    repo = FakeRepo()
-    fid = add_dubai_flight(repo)
-    c = Chat(repo)
-    open_dubai_flight(c, fid)
-    card = c.send(reply_id="cz:home")
-    assert "may need a visa" in card["body"] and "svc:visa" in c.ids()
-
-
-def test_international_booking_leads_with_the_visa_then_stay_and_forex():
-    repo = FakeRepo()
-    fid = add_dubai_flight(repo)
-    c = Chat(repo, advisor=FakeAdvisor(VisaAdvice("e_visa", "Apply online.", 30)))
-    open_dubai_flight(c, fid)
-    c.send(reply_id="cz:home"); c.send(reply_id="act:book"); c.send(reply_id="pax:1"); c.send(reply_id="name:self")
+    card = open_dubai_flight(c, fid)
+    assert "visa" not in card["body"].lower() and "passport" not in card["body"].lower()
+    assert "svc:visa" not in c.ids() and advisor.calls == []
+    c.send(reply_id="act:book")
     c.send(reply_id="cfm:yes")
-    follow = c.last[1]
-    assert [i for i, _ in follow["buttons"]] == ["svc:visa", "svc:hotel", "act:return"]
-    assert "Heads up" in follow["body"] and "currency" in follow["body"]
-    out = c.send(reply_id="svc:visa")
-    assert c.ids() == ["vpur:tourist", "vpur:business"] and "UAE" in out["body"]  # it already knows where they are going
+    assert "visa" not in c.last[1]["body"].lower() and "svc:visa" not in c.ids()
+    assert c.ids()[0] == "svc:hotel"                                      # hotel first, then the airport cab and forex
+
+
+def test_the_visa_agent_still_answers_when_asked_for_it():
+    c = Chat(advisor=FakeAdvisor())
+    out = c.send("I need a visa for Dubai")
+    assert "UAE" in out["body"] or "visa" in out["body"].lower()
 
 
 def test_suggestions_follow_the_trip():
     domestic = {"intl": False, "city": "Goa"}
     assert suggest_steps(domestic)[:2] == ["hotel", "cab"]
     abroad = {"intl": True, "city": "Paris"}
-    assert suggest_steps(abroad, visa={"needs": False})[:3] == ["hotel", "forex", "cab"]
-    assert suggest_steps(abroad, visa={"needs": True})[0] == "visa"
-    assert suggest_steps(abroad, visa=None)[0] == "visa"                   # unknown counts as worth checking
+    assert suggest_steps(abroad)[:3] == ["hotel", "cab", "forex"] and "visa" not in suggest_steps(abroad)  # never unasked
     assert suggest_steps(domestic, queue=["events"])[0] == "events" and "cab" not in suggest_steps(domestic, done=("cab",))
 
 
@@ -129,18 +87,13 @@ def test_cities_come_from_the_registry_not_the_code():
     assert places.visa_code_for("United Arab Emirates") == "AE"
 
 
-def test_a_trip_wish_to_a_place_we_cannot_book_asks_the_passport_then_gives_visa_advice():
-    advisor = FakeAdvisor(VisaAdvice("e_visa", "Apply for a B-2 visa at the US embassy.", 180))
-    c = Chat(advisor=advisor)
+def test_a_trip_wish_to_a_place_we_cannot_book_offers_a_plan_without_visa_talk():
+    c = Chat(advisor=FakeAdvisor())
     c.send("hi")
     s = Session("+919876543210", {"id": "u"}, "menu", "m1", c.repo.convos.get("+919876543210", {}).get("context", {}))
     out = asyncio.run(c.concierge._apply(s, Intent("flight", {"unknown_to": "New York"})))
-    assert "passport" in out[0]["body"] and [i for i, _ in out[0]["buttons"]] == ["cz:home", "cz:other"]
-    c.concierge.repo.save_conversation("+919876543210", s.step, s.ctx)
-    card = c.send(reply_id="cz:home")
-    assert advisor.calls == [("India", "United States")]
-    assert "e-Visa needed" in card["body"] and "can't book flights to New York" in card["body"]
-    assert "svc:visa" in c.ids() and "svc:planner" in c.ids()
+    assert "can't book flights to New York" in out[0]["body"] and "visa" not in out[0]["body"].lower()
+    assert [i for i, _ in out[0]["buttons"]] == ["svc:planner", "nav:menu"]
 
 
 def test_origin_can_be_picked_by_sharing_a_location():
@@ -149,7 +102,7 @@ def test_origin_can_be_picked_by_sharing_a_location():
     c.send(reply_id="menu:book")
     assert "location" in c.send(reply_id="from:loc")["body"].lower()
     out = c.send_location(22.72, 75.86)                                    # Indore
-    assert "Indore" in c.last[0]["body"] and out is not None and c.ids()[0].startswith("to:")
+    assert "Indore" in c.last[-1]["body"] and out is not None and "Tell me where to" in c.last[-1]["body"]
 
 
 def test_visa_answer_is_validated():

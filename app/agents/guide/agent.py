@@ -16,12 +16,16 @@ from datetime import date, timedelta
 from app.agents.base import Agent, Session
 from app.agents.forex.currencies import currency_for
 from app.agents.guide import roadmap as R
+from app.agents.guide.nlu import NO, YES, parse_answers
 from app.core.messages import buttons_msg, list_msg, text_msg
 from app.core.places import CITIES, CITY_ALIASES, city, city_pattern, country_of, visa_code_for
 from app.core.utils import inr, now_ist, parse_date
 
 logger = logging.getLogger(__name__)
 TEXT_STEPS = ("awaiting_guide_passport", "awaiting_guide_place", "awaiting_guide_date", "awaiting_guide_origin")
+# Questions that show buttons or a list: a typed answer works too, instead of restarting the guide.
+ANSWER_STEPS = ("guide_passport", "guide_known", "guide_budget", "guide_vibe", "guide_days", "guide_month", "guide_pick",
+                "guide_origin", "guide_when", "guide_trip_type")
 ASKING = ("gpass", "gkn", "gbud", "gvibe", "gdur", "gmon", "gdest", "gorg", "gwhen", "gdays", "gtrip")
 BUDGETS = [(30_000, "Under ₹30,000"), (70_000, "₹30,000 - ₹70,000"), (150_000, "₹70,000 - ₹1.5 lakh"), (300_000, "₹1.5 lakh and more")]
 VIBES = [("beach", "🏖️ Beach & relax"), ("mountains", "🏔️ Mountains & nature"), ("city", "🏙️ City & culture"),
@@ -70,7 +74,7 @@ class GuideAgent(Agent):
             s.ctx.pop(key, None)
 
     def expects_text(self, s: Session) -> bool:
-        return s.step in TEXT_STEPS
+        return s.step in TEXT_STEPS or s.step in ANSWER_STEPS
 
     # ------------------------------------------------------------------ entry points
     async def on_enter(self, s: Session) -> list[dict]:
@@ -104,6 +108,8 @@ class GuideAgent(Agent):
                 return await self._on_origin_text(s, text)
             if s.step == "awaiting_guide_date":
                 return await self._on_date_text(s, text)
+            if s.step in ANSWER_STEPS:
+                return await self._on_typed(s, text)
             return await self.on_enter(s)
         kind, _, val = reply_id.partition(":")
         t = s.ctx.setdefault("gtmp", {}) if kind in ASKING else None
@@ -169,6 +175,64 @@ class GuideAgent(Agent):
             return await self._show_roadmap(s)
         return await self.on_enter(s)
 
+    # ----------------------------------------------------------------- typed answers
+    async def _on_typed(self, s: Session, text: str) -> list[dict]:
+        """A typed answer to a question that shows options. One message can answer several questions at once."""
+        t, step, low = s.ctx.setdefault("gtmp", {}), s.step, text.strip().lower()
+        if step == "guide_passport":
+            return await self._on_passport_text(s, text)
+        if step == "guide_origin":
+            return await self._on_origin_text(s, text)
+        if step == "guide_when":
+            return await self._on_date_text(s, text)
+        if step == "guide_known":
+            if NO.match(low):
+                return self._ask_budget(s)
+            if YES.match(low):
+                s.step = "awaiting_guide_place"
+                return [text_msg("📍 Type the place, like *Dubai*, *Goa* or *Bali*.")]
+            return await self._on_place_text(s, text)  # they just named it
+        if step == "guide_pick":
+            ideas = s.ctx.get("gideas") or []
+            m = re.fullmatch(r"\D*(\d)\D*", low)
+            idx = int(m[1]) - 1 if m else next((i for i, x in enumerate(ideas) if x["place"].lower() in low), None)
+            if idx is None or not 0 <= idx < len(ideas):
+                return [text_msg("👍 Reply with the number of the idea you like, like *1*.")]
+            t["dest"] = await self._resolve(ideas[idx]["place"], ideas[idx]["country"])
+            return await self._after_destination(s)
+        said = parse_answers(text, now_ist().date(), {"guide_budget": "budget", "guide_days": "days"}.get(step))
+        if step == "guide_trip_type":
+            if "round_trip" not in said:
+                return [text_msg("👍 Say *round trip* if you are coming back, or *one way*.")]
+            t["round_trip"] = said["round_trip"]
+            return await self._build(s)
+        if step == "guide_vibe" and "vibe" not in said:
+            said["vibe"] = "any"  # no clear preference in what they typed: surprise them
+        learned = {k: said[k] for k in ("budget", "vibe", "days", "month") if k in said}
+        if not learned:
+            return [text_msg("😕 Sorry, I didn't catch that.")] + await self._ask_again(s)
+        t.update(learned)
+        if step == "guide_days" and t.get("dest"):
+            return await self._after_destination(s)
+        return await self._next_idea_question(s)
+
+    async def _ask_again(self, s: Session) -> list[dict]:
+        return {"guide_budget": self._ask_budget, "guide_vibe": self._ask_vibe, "guide_days": self._ask_duration,
+                "guide_month": self._ask_month}.get(s.step, self._ask_budget)(s)
+
+    async def _next_idea_question(self, s: Session) -> list[dict]:
+        """Ideas flow: ask for whichever of budget, kind of trip, days and month is still missing; then suggest places."""
+        t = s.ctx["gtmp"]
+        if not t.get("budget"):
+            return self._ask_budget(s)
+        if not t.get("vibe"):
+            return self._ask_vibe(s)
+        if not t.get("days"):
+            return self._ask_duration(s)
+        if not t.get("month"):
+            return self._ask_month(s)
+        return await self._suggest(s)
+
     # ----------------------------------------------------------------- the questions
     async def _need_passport_or_continue(self, s: Session) -> list[dict]:
         if s.ctx.get("citizen"):
@@ -197,7 +261,8 @@ class GuideAgent(Agent):
     def _ask_budget(self, s: Session) -> list[dict]:
         s.step = "guide_budget"
         rows = [(f"gbud:{v}", label, "per person, whole trip") for v, label in BUDGETS]
-        return [list_msg("💰 *What's your budget?*\nPer person, for the whole trip: flights, stay and food. A rough idea is fine.",
+        return [list_msg("💰 *What's your budget?*\nPer person, for the whole trip: flights, stay and food. A rough idea is fine. "
+                         "Pick below, or type it all at once, like *50000, 5 days, December, beach*.",
                          "Choose budget", rows, "Budget")]
 
     def _ask_vibe(self, s: Session) -> list[dict]:

@@ -12,23 +12,20 @@ def test_full_booking_and_cancel():
     repo = FakeRepo()
     c = Chat(repo)
     c.enter_flights()
-    assert "from:loc" in c.ids()
+    assert c.last[-1]["type"] == "text" and "flying from" in c.last[-1]["body"]  # one plain question, no list to scroll
 
-    origin = c.send(reply_id="menu:book")
-    assert {r[0] for r in origin["rows"]} == {"from:loc", "from:IDR", "from:BOM", "from:more"}  # own country first, others via "Another city"
-    dest = c.send(reply_id="from:IDR")
-    assert {r[0] for r in dest["rows"]} == {"to:BOM", "to:more"}  # only places a flight goes to, the rest can be typed
-    c.send(reply_id="to:BOM")
-    c.send(reply_id=c.ids()[1])  # tomorrow
-    results = c.send(reply_id="sort:cheap")
+    results = c.send("indore to mumbai tomorrow")  # route and date in one message: straight to the flights
+    assert results["type"] == "list"
+    c.send("cheapest")
+    results = c.last[-1]
     flight_ids = [r[0] for r in results["rows"] if r[0].startswith("flt:")]
     assert len(flight_ids) == 2  # sold-out flight hidden
     assert flight_ids[0].endswith(next(f["id"] for f in repo.flights.values() if f["price_inr"] == 3500))  # cheapest first
 
     detail = c.send(reply_id=flight_ids[1])
     assert "6E-1000" in detail["body"] and "act:book" in c.ids()
-    assert c.book()["buttons"][0][0] == "name:self"
-    assert "Aarav Sharma" in c.send(reply_id="name:self")["body"]
+    summary = c.book()  # one traveller we know by name: straight to the summary, no questions
+    assert "Aarav Sharma" in summary["body"] and [i for i, _ in summary["buttons"]][0] == "cfm:yes"
 
     done = c.send(reply_id="cfm:yes")
     assert "Booking Confirmed" in done["body"] and "ABC123" in done["body"]
@@ -122,12 +119,8 @@ def test_multiple_travellers_names_total_and_seats():
     c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
     c.send(reply_id=c.ids()[1]); c.send(reply_id="sort:time")
     c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))  # 6E-1000: 3 seats, Rs 4,000
-    pax = c.send(reply_id="act:book")
-    assert [r[0] for r in pax["rows"]] == ["pax:1", "pax:2", "pax:3"] and "8,000" in pax["rows"][1][2]
-    c.send(reply_id="pax:2")
-    c.send(reply_id="name:self")
-    assert "traveller 2 of 2" in c.last[0]["body"]
-    confirm = c.send("priya sharma")
+    assert "type the traveller name" in c.last[-1]["body"]  # names can be typed right under the flight
+    confirm = c.send("Aarav Sharma, priya sharma")
     assert "Aarav Sharma" in confirm["body"] and "Priya Sharma" in confirm["body"] and "8,000" in confirm["body"]
     done = c.send(reply_id="cfm:yes")
     assert "2 travellers" in done["body"] and seats(repo, "6E-1000") == 1
@@ -189,7 +182,7 @@ def test_a_route_with_no_flights_offers_the_cities_that_do_fly_there():
     out = c.send("dubai")
     assert "no direct flights from *Indore* to *Dubai*" in out["body"] and c.ids() == ["from:BOM"]
     assert "km away" in out["rows"][0][2] and "from ₹15,000" in out["rows"][0][2] and "nearest to you" in out["body"]
-    assert "Got it" not in c.send(reply_id="from:BOM")["body"] and c.last[0]["type"] == "list"  # carries on to the date, Dubai remembered
+    assert c.send(reply_id="from:BOM")["type"] == "text"  # carries on to the date, Dubai remembered
     assert "Mumbai ➜ Dubai" in c.last[0]["body"]
 
 
@@ -228,3 +221,58 @@ def test_a_city_with_no_departures_offers_the_nearest_airports_that_have_some():
     c.concierge.repo.flights["z1"] = f                                     # ...except Mumbai
     out = c.send(reply_id="from:IDR")
     assert "no flights leaving *Indore*" in out["body"] and c.ids() == ["from:BOM"] and "km away" in out["rows"][0][2]
+
+
+# ------------------------------------------------------------------ natural language: few messages, no menus
+def test_one_message_with_route_date_and_round_trip_goes_straight_to_the_flights():
+    c = Chat()
+    c.send("I want to fly to mumbai. Show me flights.")
+    assert c.last[-1]["type"] == "text" and "Mumbai" in c.last[-1]["body"] and "flying from" in c.last[-1]["body"]
+    out = c.send(f"Indore to Mumbai, tomorrow, round trip till {(now_ist().date() + timedelta(days=4)):%d/%m}")
+    assert out["type"] == "list" and out["rows"][0][0].startswith("flt:")
+
+
+def test_a_booking_takes_four_messages_from_hello_to_the_summary():
+    c = Chat()
+    c.send("flight from indore to mumbai tomorrow")           # 1: the request
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))  # 2: pick a flight
+    summary = c.send("book")                                    # 3: book (the name is already known)
+    assert "Last check" in summary["body"] and "Aarav Sharma" in summary["body"]
+    assert "Booking Confirmed" in c.send("yes")["body"]          # 4: confirm
+
+
+def test_names_typed_under_the_flight_card_set_the_party_and_the_total():
+    c = Chat()
+    c.send("flight from indore to mumbai tomorrow")
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
+    summary = c.send("Rahul Verma and Priya Verma")
+    assert "Rahul Verma" in summary["body"] and "Priya Verma" in summary["body"] and "×" in summary["body"]
+
+
+def test_the_return_date_given_up_front_is_used_for_the_return_flight():
+    from datetime import timedelta
+    from app.core.utils import now_ist
+    repo = FakeRepo()
+    for f in list(repo.flights.values()):  # the reverse route, a few days later
+        back = f.copy()
+        back.update(id="r" + f["id"], from_code=f["to_code"], to_code=f["from_code"],
+                    departure_time=(now_ist() + timedelta(days=4, hours=3)).isoformat(),
+                    arrival_time=(now_ist() + timedelta(days=4, hours=5)).isoformat(), seats_left=5, status="scheduled")
+        repo.flights[back["id"]] = back
+    c = Chat(repo)
+    back_day = now_ist().date() + timedelta(days=4)
+    c.send(f"flight from indore to mumbai tomorrow and back on {back_day:%d/%m}")
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
+    c.send("book"); out = c.send("yes")
+    assert "coming back" in c.last[1]["body"]
+    ret = c.send(reply_id="act:return")
+    assert "Mumbai ➜ Indore" in ret["body"] and ret["type"] == "list"
+
+
+def test_trip_parser_understands_ranges_and_party():
+    from datetime import date
+    from app.agents.flight.nlu import parse_trip
+    today = date(2026, 10, 2)
+    got = parse_trip("12-23 round trip for 2 people", today)
+    assert got["date"] == "2026-10-12" and got["return_date"] == "2026-10-23" and got["round_trip"] and got["pax"] == 2
+    assert "return_date" not in parse_trip("tomorrow one way", today)

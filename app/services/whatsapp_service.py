@@ -9,6 +9,10 @@ import httpx
 GRAPH_URL = "https://graph.facebook.com/v19.0"
 
 
+_media_ids: dict[str, str] = {}  # photo link -> WhatsApp media id (ids stay valid for 30 days; kept for the life of the process)
+MAX_PHOTO_BYTES = 5_000_000
+
+
 class WhatsAppService:
     @staticmethod
     def _escape_unicode(body: bytes) -> bytes:
@@ -111,11 +115,12 @@ class WhatsAppService:
         }
 
     @staticmethod
-    async def _post(to_number: str | None, payload: dict):
+    async def _post(to_number: str | None, payload: dict) -> bool:
+        """True if Meta accepted the message."""
         phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
         if not phone_number_id:
             print("WhatsApp Phone Number ID not configured.")
-            return
+            return False
 
         url = f"{GRAPH_URL}/{phone_number_id}/messages"
         headers = {
@@ -128,10 +133,12 @@ class WhatsAppService:
             try:
                 response = await client.post(url, headers=headers, json=data)
                 response.raise_for_status()
+                return True
             except httpx.HTTPStatusError as e:
                 print(f"Failed to send message to {to_number}: {e.response.text}")
             except Exception as e:
                 print(f"Failed to send message to {to_number}: {e}")
+        return False
 
     @staticmethod
     async def download_media(media_id: str, max_bytes: int = 8_000_000) -> tuple[bytes, str]:
@@ -162,16 +169,64 @@ class WhatsAppService:
 
     @staticmethod
     async def send(to_number: str, msg: dict):
-        """Send one message built with text_msg / buttons_msg / list_msg, or an emoji reaction."""
+        """Send one message built with text_msg / buttons_msg / list_msg, or an emoji reaction.
+        A photo Meta cannot fetch (a dead link) must never cost the user the message itself: it is resent without the photo."""
+        if await WhatsAppService._send(to_number, msg):
+            return
+        if msg["type"] == "image":
+            if msg["body"]:
+                await WhatsAppService._send(to_number, {"type": "text", "body": msg["body"]})
+        elif msg.get("image"):
+            await WhatsAppService._send(to_number, {k: v for k, v in msg.items() if k != "image"})
+
+    @staticmethod
+    async def _media_id(url: str) -> str | None:
+        """Download a public photo and upload it to WhatsApp, once. Sending "by link" is accepted by Meta at once and fetched
+        later, so a photo it cannot fetch just never shows up; an upload fails right here, where we can still send the text."""
+        if url in _media_ids:
+            return _media_ids[url]
+        if not settings.WHATSAPP_PHONE_NUMBER_ID:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                photo = await client.get(url)
+                photo.raise_for_status()
+                mime = photo.headers.get("content-type", "").split(";")[0].strip()
+                if mime not in ("image/jpeg", "image/png") or len(photo.content) > MAX_PHOTO_BYTES:
+                    raise ValueError(f"not a usable photo ({mime or 'unknown type'}, {len(photo.content)} bytes)")
+                up = await client.post(
+                    f"{GRAPH_URL}/{settings.WHATSAPP_PHONE_NUMBER_ID}/media",
+                    headers={"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"},
+                    data={"messaging_product": "whatsapp", "type": mime},
+                    files={"file": ("photo" + (".png" if mime == "image/png" else ".jpg"), photo.content, mime)})
+                up.raise_for_status()
+                _media_ids[url] = up.json()["id"]
+                return _media_ids[url]
+        except Exception as e:
+            print(f"Could not upload the photo {url}: {getattr(getattr(e, 'response', None), 'text', None) or e}")
+            return None
+
+    @staticmethod
+    async def _send(to_number: str, msg: dict) -> bool:
         kind = msg["type"]
-        if kind == "reaction":
+        photo = msg["url"] if kind == "image" else msg.get("image")
+        media = None
+        if photo:
+            media_id = await WhatsAppService._media_id(photo)
+            if not media_id:
+                return False
+            media = {"id": media_id}
+        header = {"header": {"type": "image", "image": media}} if media and kind != "image" else {}
+        if kind == "image":
+            payload = {"type": "image", "image": {**media, **({"caption": msg["body"]} if msg.get("body") else {})}}
+        elif kind == "reaction":
             payload = {"type": "reaction", "reaction": {"message_id": msg["message_id"], "emoji": msg["emoji"]}}
         elif kind == "document":
             payload = {"type": "document", "document": {"link": msg["url"], "filename": msg["filename"],
                                                         **({"caption": msg["caption"]} if msg.get("caption") else {})}}
         elif kind == "cta":
             payload = {"type": "interactive", "interactive": {
-                "type": "cta_url",
+                "type": "cta_url", **header,
                 "body": {"text": msg["body"]},
                 "action": {"name": "cta_url", "parameters": {"display_text": msg["button_text"], "url": msg["url"]}},
             }}
@@ -182,7 +237,7 @@ class WhatsAppService:
             payload = {"type": "text", "text": {"body": msg["body"]}}
         elif kind == "buttons":
             payload = {"type": "interactive", "interactive": {
-                "type": "button",
+                "type": "button", **header,
                 "body": {"text": msg["body"]},
                 "action": {"buttons": [
                     {"type": "reply", "reply": {"id": i, "title": t}} for i, t in msg["buttons"]
@@ -200,4 +255,4 @@ class WhatsAppService:
             }}
         else:
             raise ValueError(f"Unknown message type: {kind}")
-        await WhatsAppService._post(to_number, payload)
+        return await WhatsAppService._post(to_number, payload)

@@ -1,7 +1,8 @@
 import asyncio
 from datetime import timedelta
 
-from fakes import Chat, FakeGateway, FakeRepo, WA
+from fakes import CONTACT, Chat, FakeGateway, FakeRepo, WA
+from app.agents.checkout import parse_contact
 from app.core.utils import now_ist
 
 
@@ -9,17 +10,43 @@ def seats(repo, no):
     return next(f for f in repo.flights.values() if f["flight_no"] == no)["seats_left"]
 
 
-def pay_flow(c, travellers=1):
-    """Chat up to the payment request."""
-    c.enter_flights()
-    c.send(reply_id="menu:book"); c.send(reply_id="from:IDR"); c.send(reply_id="to:BOM")
-    c.send(reply_id=c.ids()[1]); c.send(reply_id="sort:time")
+def pay_flow(c, travellers=1, contact=CONTACT):
+    """Chat up to the payment request: request, pick, book, confirm, and (the first time) who is paying."""
+    c.send("flight from indore to mumbai tomorrow")
     c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))  # 6E-1000, Rs 4,000, 3 seats
-    c.book(travellers)
-    c.send(reply_id="name:self")
     if travellers > 1:
-        c.send("priya sharma")
-    return c.send(reply_id="cfm:yes")
+        c.send("Aarav Sharma, Priya Sharma")
+    else:
+        c.send("book")
+    out = c.send("yes")
+    return c.send(contact) if contact and "email" in out["body"] else out
+
+
+def test_the_payment_asks_for_name_email_and_phone_once():
+    repo, gw = FakeRepo(), FakeGateway()
+    c = Chat(repo, gateway=gw)
+    c.send("flight from indore to mumbai tomorrow")
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
+    c.send("book")
+    ask = c.send("yes")
+    assert "full name, email and phone number" in ask["body"] and "4,000" in ask["body"] and gw.links == {}
+    assert "still need your email" in c.send("Aarav Sharma, 9876543210")["body"]  # asks only for what is missing
+    out = c.send("aarav@example.com")
+    assert out["type"] == "cta" and gw.links["plink_1"]["email"] == "aarav@example.com"
+    assert gw.links["plink_1"]["phone"] == "+9876543210" and gw.links["plink_1"]["name"] == "Aarav Sharma"
+    # next purchase: the details are remembered, the link comes straight away
+    gw.paid.add("plink_1"); c.send(reply_id="chk:check")
+    c.send("flight from mumbai to indore tomorrow")
+    if c.ids()[0].startswith("flt:"):
+        c.send(reply_id=c.ids()[0]); c.send("book")
+        assert c.send("yes")["type"] == "cta"
+
+
+def test_contact_parser_takes_the_details_in_any_order():
+    assert parse_contact("Rahul Verma, rahul@mail.com, 98765 43210") == {"name": "Rahul Verma", "email": "rahul@mail.com", "phone": "9876543210"}
+    assert parse_contact("my email is r@x.in", WA)["email"] == "r@x.in"
+    assert parse_contact("same", "+919876543210")["phone"] == "919876543210"
+    assert parse_contact("98765 43210 rahul@mail.com Rahul") == {"name": "Rahul", "email": "rahul@mail.com", "phone": "9876543210"}
 
 
 def test_confirm_holds_seats_and_sends_a_payment_link():
@@ -28,46 +55,55 @@ def test_confirm_holds_seats_and_sends_a_payment_link():
     out = pay_flow(c)
     assert [m["type"] for m in c.last] == ["cta", "buttons"]
     assert out["url"] == "https://rzp.io/i/plink_1" and "Pay ₹4,000" == out["button_text"]
-    assert "Test mode" in out["body"] and "held for 20 minutes" in out["body"]
-    assert [i for i, _ in c.last[1]["buttons"]] == ["pay:check", "pay:cancel"]
+    assert "Test mode" in out["body"] and "Held for 20 minutes" in out["body"]
+    assert [i for i, _ in c.last[1]["buttons"]] == ["chk:check", "chk:cancel"]
     booking = next(iter(repo.bookings.values()))
     assert booking["status"] == "pending" and seats(repo, "6E-1000") == 2  # held, not yet confirmed
     assert gw.links["plink_1"]["amount"] == 4000 and gw.links["plink_1"]["ref"] == booking["pnr"]
+
+
+def test_nothing_is_held_until_checkout():
+    repo, gw = FakeRepo(), FakeGateway()
+    c = Chat(repo, gateway=gw)
+    c.send("flight from indore to mumbai tomorrow")
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
+    c.send("book"); c.send("yes")                       # waiting for contact details
+    assert repo.bookings == {} and seats(repo, "6E-1000") == 3
 
 
 def test_ive_paid_confirms_once_razorpay_says_paid():
     repo, gw = FakeRepo(), FakeGateway()
     c = Chat(repo, gateway=gw)
     pay_flow(c)
-    assert "haven't received the payment" in c.send(reply_id="pay:check")["body"]
+    assert "haven't received the payment" in c.send(reply_id="chk:check")["body"]
     gw.paid.add("plink_1")
-    done = c.send(reply_id="pay:check")
+    done = c.send(reply_id="chk:check")
     assert "Booking Confirmed" in done["body"] and next(iter(repo.bookings.values()))["status"] == "confirmed"
-    assert c.send(reply_id="pay:check") is not None  # a stale tap after confirming is harmless
-    assert "Already" in c.last[0]["body"] or "no longer" in c.last[0]["body"] or "couldn't find" in c.last[0]["body"]
+    assert c.send(reply_id="chk:check") is not None  # a stale tap after confirming is harmless
+    assert "no payment waiting" in c.last[0]["body"]
 
 
 def test_webhook_confirms_and_is_idempotent():
     repo, gw = FakeRepo(), FakeGateway()
     c = Chat(repo, gateway=gw)
     pay_flow(c, travellers=2)
-    flight = c.concierge.agents["flight"]
-    number, messages = asyncio.run(flight.confirm_payment("plink_1"))
+    number, messages = asyncio.run(c.concierge.confirm_payment("plink_1"))
     assert number == WA and "Booking Confirmed" in messages[0]["body"] and "2 travellers" in messages[0]["body"]
     assert all(m["type"] != "reaction" for m in messages)  # nothing to react to: the user didn't tap
-    assert asyncio.run(flight.confirm_payment("plink_1")) is None  # Razorpay retried: no second ticket
-    assert repo.convos["+" + WA]["context"]["trip"]["city"] == "Mumbai"  # cabs/hotels can use the trip
-    assert "Already confirmed" in c.send(reply_id="pay:check")["body"]
+    assert asyncio.run(c.concierge.confirm_payment("plink_1")) is None  # Razorpay retried: no second ticket
+    ctx = repo.convos["+" + WA]["context"]
+    assert ctx["trip"]["city"] == "Mumbai" and "checkout" not in ctx  # cabs/hotels can use the trip; the checkout is done
+    assert "no payment waiting" in c.send(reply_id="chk:check")["body"]
 
 
 def test_cancelling_before_paying_releases_the_seats():
     repo, gw = FakeRepo(), FakeGateway()
     c = Chat(repo, gateway=gw)
     pay_flow(c)
-    assert "released your seats" in c.send(reply_id="pay:cancel")["body"]
+    assert "released everything" in c.send(reply_id="chk:cancel")["body"]
     assert next(iter(repo.bookings.values()))["status"] == "cancelled" and seats(repo, "6E-1000") == 3
     assert gw.cancelled == {"plink_1"} and repo.payments["plink_1"]["status"] == "cancelled"
-    assert asyncio.run(c.concierge.agents["flight"].confirm_payment("plink_1")) is None  # a late payment can't revive it
+    assert asyncio.run(c.concierge.confirm_payment("plink_1")) is None  # a late payment can't revive it
 
 
 def test_unpaid_bookings_expire_and_the_user_is_told():
@@ -79,7 +115,7 @@ def test_unpaid_bookings_expire_and_the_user_is_told():
     assert len(notices) == 1 and notices[0][0] == WA and "payment window" in notices[0][1][0]["body"]
     assert seats(repo, "6E-1000") == 3 and next(iter(repo.bookings.values()))["status"] == "cancelled"
     assert asyncio.run(c.concierge.agents["flight"].release_expired()) == []  # only once
-    assert "window ended" in c.send(reply_id="pay:check")["body"]
+    assert "window ended" in c.send(reply_id="chk:check")["body"]
 
 
 def test_payment_service_down_releases_seats_instead_of_stranding_them():
@@ -91,6 +127,16 @@ def test_payment_service_down_releases_seats_instead_of_stranding_them():
     assert seats(repo, "6E-1000") == 3 and next(iter(repo.bookings.values()))["status"] == "cancelled"
 
 
+def test_a_seat_sold_meanwhile_is_caught_at_checkout_and_nothing_is_held():
+    repo, gw = FakeRepo(), FakeGateway()
+    c = Chat(repo, gateway=gw)
+    c.send("flight from indore to mumbai tomorrow")
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
+    c.send("book"); c.send("yes")
+    next(f for f in repo.flights.values() if f["flight_no"] == "6E-1000")["seats_left"] = 0
+    assert "no longer available" in c.send(CONTACT)["body"] and repo.bookings == {} and gw.links == {}
+
+
 def test_without_razorpay_keys_bookings_confirm_instantly():
     class Off(FakeGateway):
         enabled = False
@@ -98,3 +144,36 @@ def test_without_razorpay_keys_bookings_confirm_instantly():
     c = Chat(gateway=Off())
     c.enter_flights(); c.pick_flight()
     assert "Booking Confirmed" in c.send(reply_id="cfm:yes")["body"]
+
+
+# ---------------------------------------------------------------------------- one payment for the whole trip
+def test_flight_and_hotel_are_paid_together_with_one_link():
+    repo, gw = FakeRepo(), FakeGateway()
+    c = Chat(repo, gateway=gw)
+    c.send("flight from indore to mumbai tomorrow and a hotel there")
+    c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
+    c.send("book")
+    out = c.send("yes")                                          # flight added to the bundle, the hotel comes next
+    assert "Added to your bundle" in c.last[0]["body"] and "hotel" in c.last[0]["body"].lower() and gw.links == {}
+    assert repo.bookings == {}                                   # nothing held yet
+    assert "How many nights" in c.last[-1]["body"]
+    results = c.send("2 nights for 2 people")
+    assert results["type"] == "list" and "Mumbai" in results["body"]
+    c.send(reply_id=results["rows"][0][0])                       # a hotel
+    c.send(reply_id=c.ids()[0])                                  # its first room
+    c.send(reply_id="hname:self")
+    ask = c.send(reply_id="hcfm:yes")                            # both chosen: one question about who is paying
+    assert "Your bundle" in ask["body"] and "Total *₹" in ask["body"] and gw.links == {} and repo.bookings == {}
+    pay = c.send(CONTACT)
+    flight_total = 4000
+    hotel_total = c.hotel_repo.bookings and next(iter(c.hotel_repo.bookings.values()))["total_price_inr"]
+    assert pay["type"] == "cta" and len(gw.links) == 1                      # ONE link for everything
+    assert gw.links["plink_1"]["amount"] == flight_total + hotel_total
+    assert gw.links["plink_1"]["description"].count("+") == 1
+    assert next(iter(repo.bookings.values()))["status"] == "pending" and next(iter(c.hotel_repo.bookings.values()))["status"] == "pending"
+    gw.paid.add("plink_1")
+    c.send(reply_id="chk:check")
+    bodies = " ".join(m.get("body", "") for m in c.last)
+    assert "Booking Confirmed" in bodies and "Stay Confirmed" in bodies                  # both confirmed by the one payment
+    assert next(iter(repo.bookings.values()))["status"] == "confirmed" and next(iter(c.hotel_repo.bookings.values()))["status"] == "confirmed"
+    assert bodies.count("Want me to arrange") == 0                                      # the hotel is not offered again

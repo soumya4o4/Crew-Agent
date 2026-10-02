@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from app.agents.base import Agent, Session
 from app.core.geo import fmt_dist, fresh_location, haversine_m, maps_link, nearest_city
 from app.core.messages import buttons_msg, cta_msg, list_msg, location_request_msg, text_msg
-from app.core.places import CITIES, CITY_ALIASES, city
+from app.core.places import CITIES, find_city, city
 from app.core.utils import IST, inr, now_ist, to_ist
 
 WINDOWS_DAYS = (7, 30)  # look a week ahead first, then a month
@@ -64,7 +64,7 @@ class EventsAgent(Agent):
                 return self._ask_where(s)
             return await self._show(s)
         if s.step == "awaiting_event_where" and text:
-            code = CITY_ALIASES.get(text.lower().strip())
+            code = find_city(text)
             if code not in CITIES:
                 return [text_msg("😕 I list events in: " + ", ".join(sorted(CITIES.values())) + ". Type one of these, or share your location.")]
             s.ctx["ev"] = {"city": code}

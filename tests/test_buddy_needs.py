@@ -30,9 +30,9 @@ def test_a_stay_already_booked_at_the_destination_is_not_suggested_again():
     assert "hotel" not in services(next_needs(now=NOW, text="hi", flight=flight(), stay=stay, trip=None, has_location=False))
 
 
-def test_flying_abroad_adds_visa_and_forex():
+def test_flying_abroad_adds_forex_but_never_a_visa():
     needs = next_needs(now=NOW, text="hello", flight=flight("BOM", "DXB", in_hours=60), stay=None, trip=None, has_location=False)
-    assert services(needs) == ["hotel", "visa", "forex"]                    # far enough away that no airport cab yet
+    assert services(needs) == ["hotel", "forex", "events"]                    # far enough away that no airport cab yet
 
 
 def test_a_question_about_the_hotel_leads_to_a_ride_and_food_nearby():
@@ -77,4 +77,4 @@ def test_flights_opens_straight_on_the_route_with_the_last_trip_one_tap_away():
     c = Chat()
     c.enter_flights(); c.pick_flight(); c.send(reply_id="cfm:yes")
     c.send(reply_id="nav:menu"); out = c.send(reply_id="svc:flight")
-    assert out["type"] == "list" and "Flights" in out["body"] and out["rows"][1][0] == "trip:IDR-BOM"
+    assert out["type"] == "text" and "Flights" in out["body"] and "Tell me" in out["body"]

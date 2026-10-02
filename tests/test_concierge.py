@@ -2,7 +2,7 @@ import asyncio
 from datetime import date
 from types import SimpleNamespace
 
-from fakes import Chat, FakeRepo
+from fakes import Chat, FakeRepo, WA
 from app.agents.concierge.classifiers import KeywordClassifier, LLMClassifier, OpenAIClassifier
 from app.agents.concierge.router import IntentRouter
 from app.agents.concierge.slots import extract_slots
@@ -12,11 +12,14 @@ TODAY = date(2026, 10, 1)  # a Thursday
 
 def test_main_menu_lists_every_service():
     c = Chat()
-    assert c.send("hi")["type"] == "list"
+    out = c.send("hi")  # a welcome and one question: no menu to scroll
+    assert [m["type"] for m in c.last] == ["text", "text"] and "complete trip planning" in out["body"]
+    assert "what you'd like to do" in c.last[1]["body"]
+    assert c.send(reply_id="nav:menu")["type"] == "list"  # the full menu is still one tap away from any "Menu" button
     assert c.ids() == ["svc:guide", "svc:flight", "svc:hotel", "svc:cab", "svc:nearby", "svc:events",
                        "svc:visa", "svc:forex", "menu:bookings"]
     c.send(reply_id="svc:flight")
-    assert "from:loc" in c.ids()  # Flights opens straight on "where from?", no menu to click through
+    assert c.last[-1]["type"] == "text" and "flying from" in c.last[-1]["body"]  # Flights opens on one plain question, no menu to click through
 
 
 def test_free_text_flight_request_skips_known_steps():
@@ -28,15 +31,15 @@ def test_free_text_flight_request_skips_known_steps():
 def test_destination_only_asks_for_origin_then_continues():
     c = Chat()
     c.send("book a flight to mumbai")
-    assert c.last[-1]["type"] == "list" and "from:IDR" in c.ids()
-    c.send(reply_id="from:IDR")
-    assert c.ids()[0].startswith("date:")  # destination was remembered
+    assert c.last[-1]["type"] == "text" and "flying from" in c.last[-1]["body"]
+    c.send("Indore, tomorrow")
+    assert c.ids()[0].startswith("flt:")  # destination was remembered, so the flights are shown
 
 
 def test_hotel_request_routes_to_hotel_agent_and_skips_the_known_city():
     c = Chat()
     assert "Goa" in c.send("I need a hotel in goa")["body"]
-    assert c.ids()[0].startswith("hin:")  # the city is known, so the next question is the check-in date
+    assert c.last[-1]["type"] == "text" and "check in" in c.last[-1]["body"]  # the city is known: next question is a plain-text date
 
 
 def test_planner_agent_is_coming_soon_and_events_agent_asks_where():
@@ -66,10 +69,10 @@ def test_multi_part_request_does_flight_now_and_queues_the_rest():
     c = Chat()
     c.send("flight to mumbai and a hotel there")
     assert "start with flights" in c.last[0]["body"] and "hotels" in c.last[0]["body"]
-    assert c.concierge.agents["flight"] and "from:IDR" in c.ids()  # flight flow is already running
-    c.send(reply_id="from:IDR"); c.send(reply_id=c.ids()[1]); c.send(reply_id="sort:time")
+    assert c.concierge.agents["flight"] and "flying from" in c.last[-1]["body"]  # flight flow is already running
+    c.send("from indore tomorrow")
     c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
-    c.book(); c.send(reply_id="name:self"); c.send(reply_id="cfm:yes")
+    c.book(); c.send(reply_id="cfm:yes")
     assert "You also mentioned a hotel" in c.last[1]["body"] and "svc:hotel" in c.ids()
     c.send(reply_id="svc:hotel")  # tapping it moves on to the queued service, which knows where the flight lands
     assert "hotel:trip" in c.ids()
@@ -80,10 +83,10 @@ def test_vague_request_offers_relevant_options_and_keeps_details():
     out = c.send("I want to go to goa")
     assert out["type"] == "buttons" and "Goa" in out["body"]
     assert c.ids() == ["svc:flight", "svc:hotel", "svc:planner"]
-    c.send(reply_id="svc:flight")  # "Goa" is remembered: only the origin is missing
-    assert "from:IDR" in c.ids()
-    c.send(reply_id="from:IDR")
-    assert c.ids()[0].startswith("date:")
+    c.send(reply_id="svc:flight")  # "Goa" is remembered: only the origin and date are missing
+    assert "flying from" in c.last[-1]["body"] and "Goa" in c.last[-1]["body"]
+    c.send("from indore tomorrow")
+    assert "Goa" in c.last[-1]["body"] and "Indore" in c.last[-1]["body"]  # the route and date were understood in one go
 
 
 def test_llm_options_and_question_are_offered():
@@ -190,5 +193,12 @@ def test_missing_messages_table_does_not_break_the_bot():
 
     llm = _fake_llm({"intent": "smalltalk", "reply": "Hello! ✈️"})
     c = Chat(NoHistoryRepo(), router=IntentRouter(llm))
-    c.enter_flights()  # an active agent makes the Concierge read history
+    c.send("hi"); c.send(reply_id="svc:hotel")  # an active agent makes the Concierge read history
     assert "Hello" in c.send("how are you?")["body"]
+
+
+def test_a_service_the_user_did_not_name_is_not_queued():
+    llm = _fake_llm({"intent": "flight", "also": ["hotel"], "to_city": "Mumbai"})
+    c = Chat(router=IntentRouter(llm))
+    c.send("I would like to go to mumbai. Show me flights")
+    assert "hotels" not in c.last[0]["body"] and not c.repo.convos["+" + WA]["context"].get("queue")

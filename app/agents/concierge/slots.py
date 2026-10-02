@@ -2,7 +2,7 @@
 import re
 from datetime import date, timedelta
 
-from app.core.geo import _ALIAS_RE
+from app.core.geo import _ALIAS_RE, NEAR_ME
 from app.core.places import CITY_ALIASES, COUNTRY_ALIASES, city_pattern, country_pattern
 from app.core.utils import WEEKDAYS, parse_date
 from app.agents.forex.currencies import find_currency, parse_amount
@@ -66,6 +66,8 @@ def extract_slots(text: str, today: date) -> dict:
         slots["country"] = country
     if place := find_place(t):
         slots["place"] = place
+    if NEAR_ME.search(t):
+        slots["near_me"] = True
     if cur := find_currency(t):  # "100 usd", "dirhams for dubai": only when a currency is named do numbers mean money
         slots["currency"] = cur
         if (amt := parse_amount(t)) and amt[1] in (None, cur, "INR") and "date" not in slots:
