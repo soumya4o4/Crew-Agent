@@ -37,12 +37,7 @@ def next_needs(*, now: datetime, text: str, flight: dict | None, stay: dict | No
         if is_international(f["from_code"], f["to_code"]):
             needs += [("forex", "💱 Forex")]
         needs.append(("events", _label("🎟️", city(f["to_code"]) + " events")))
-    elif trip and trip.get("to") and not f:  # booked earlier, further away: still worth planning around
-        if trip["to"] != hotel_city:
-            needs.append(("hotel", _label("🏨 Stay in", trip.get("city") or city(trip["to"]))))
-        if trip.get("intl"):
-            needs += [("forex", "💱 Forex")]
-        needs.append(("cab", "🚕 Airport cab"))
+
 
     if stay and ABOUT_STAY.search(low):
         needs = [("cab", "🚕 Ride to hotel"), ("nearby", "🧭 Food nearby"), ("events", "🎟️ Things to do")] + needs

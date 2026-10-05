@@ -54,6 +54,19 @@ def verify_webhook(request: Request):
 
 async def process_message(msg: dict) -> None:
     """Run the flow for one message and send the replies. Messages from the same person go one after another."""
+    if msg.get("media") and msg["media"]["kind"] == "audio" and settings.OPENAI_API_KEY:
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            audio_bytes, _ = await WhatsAppService.download_media(msg["media"]["id"])
+            resp = await client.audio.transcriptions.create(model="whisper-1", file=("audio.ogg", audio_bytes, "audio/ogg"))
+            transcribed_text = (getattr(resp, "text", "") or "")
+            if transcribed_text:
+                msg["text"] = transcribed_text
+                msg["media"] = None  # treat as pure text
+        except Exception as e:
+            logger.error(f"Failed to transcribe audio: {e}")
+
     lock = _locks.setdefault(msg["whatsapp_number"], asyncio.Lock())
     async with lock:
         try:

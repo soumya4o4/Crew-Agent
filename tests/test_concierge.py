@@ -2,7 +2,7 @@ import asyncio
 from datetime import date
 from types import SimpleNamespace
 
-from fakes import Chat, FakeRepo, WA
+from fakes import DETAILS, Chat, FakeRepo, WA
 from app.agents.concierge.classifiers import KeywordClassifier, LLMClassifier, OpenAIClassifier
 from app.agents.concierge.router import IntentRouter
 from app.agents.concierge.slots import extract_slots
@@ -72,7 +72,7 @@ def test_multi_part_request_does_flight_now_and_queues_the_rest():
     assert c.concierge.agents["flight"] and "flying from" in c.last[-1]["body"]  # flight flow is already running
     c.send("from indore tomorrow")
     c.send(reply_id=next(i for i in c.ids() if i.startswith("flt:")))
-    c.book(); c.send(reply_id="cfm:yes")
+    c.book(); c.send(DETAILS); c.send(reply_id="cfm:yes")
     assert "You also mentioned a hotel" in c.last[1]["body"] and "svc:hotel" in c.ids()
     c.send(reply_id="svc:hotel")  # tapping it moves on to the queued service, which knows where the flight lands
     assert "hotel:trip" in c.ids()

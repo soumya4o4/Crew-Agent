@@ -129,7 +129,7 @@ class CheckoutAgent(Agent):
         cart, contact = s.ctx.get("cart") or [], s.ctx["contact"]
         held: list[tuple[Agent, dict, dict]] = []  # (agent, item, booking)
         for item in cart:
-            agent = self.agents[item["kind"]]
+            agent = self.agents[item.get("agent") or item["kind"]]
             booking = await agent.create_pending(s, item)
             if not booking:
                 for a, _, b in held:
@@ -159,11 +159,19 @@ class CheckoutAgent(Agent):
         s.ctx["bundle_kinds"] = [i["kind"] for _, i, _ in held]
         s.ctx.pop("cart", None)
         s.step = "awaiting_payment"
-        test = "\n🧪 Test mode: no real money is charged." if getattr(self.payments, "test_mode", False) else ""
+        test = "\n\n🧪 Test mode — no real money will be charged." if getattr(self.payments, "test_mode", False) else ""
+        if len(held) == 1 and held[0][1]["kind"] == "hotel":
+            item = held[0][1]
+            body = (f"💳 Your hotel stay is ready\n\n"
+                    f"{item.get('summary_text', self._lines([item]))}\n"
+                    f"💰 {inr(total)} total{test}\n\nProceed to payment?")
+        else:
+            body = (f"💳 *Almost done!* Pay *{inr(total)}* to confirm everything:\n{self._lines([i for _, i, _ in held])}\n"
+                    f"⏳ Held for {PAYMENT_WINDOW_MIN} minutes.{test}")
+                    
         return [
-            cta_msg(f"💳 *Almost done!* Pay *{inr(total)}* to confirm everything:\n{self._lines([i for _, i, _ in held])}\n"
-                    f"⏳ Held for {PAYMENT_WINDOW_MIN} minutes.{test}", f"Pay {inr(total)}", link["short_url"]),
-            buttons_msg("I'll confirm your tickets here the moment the payment goes through ✅",
+            cta_msg(body, f"Pay {inr(total)}", link["short_url"]),
+            buttons_msg("I'll confirm your booking here the moment the payment goes through ✅",
                         [("chk:check", "✅ I've paid"), ("chk:cancel", "❌ Cancel")])]
 
     # ------------------------------------------------------------------ taps and words while paying
@@ -177,23 +185,36 @@ class CheckoutAgent(Agent):
                                 [("chk:check", "✅ I've paid"), ("chk:cancel", "❌ Cancel")])]
         return [text_msg("Tell me what you'd like to book and I'll take care of it. ✈️")]
 
+    async def abandon(self, s: Session) -> None:
+        """The traveller walked away from a payment (cancelled, or said "reset"): give back everything still held and kill
+        the payment link. Bookings that are already paid stay booked."""
+        co = s.ctx.get("checkout")
+        if not co:
+            return
+        try:  # paid a moment ago, webhook not here yet: leave the bookings for the webhook to confirm
+            paid = await self.payments.link_status(co["link_id"]) == "paid"
+        except Exception:
+            paid = False
+        if not paid and "confirmed" not in [await self.agents[i.get("agent") or i["kind"]].booking_state(i["booking_id"]) for i in co["items"]]:
+            for i in co["items"]:
+                await self.agents[i.get("agent") or i["kind"]].release_booking(i["booking_id"])
+            try:
+                await self.payments.cancel_link(co["link_id"])
+            except Exception:
+                logger.warning("Could not cancel the payment link %s", co["link_id"])
+        self._clear(s.ctx)
+
     async def _on_tap(self, s: Session, action: str) -> list[dict]:
         co = s.ctx.get("checkout")
         if not co:
             s.step = "menu"
             return [buttons_msg("There's no payment waiting. If you've already paid, your confirmation is above. ✅", [("nav:menu", "🏠 Menu")])]
-        states = [await self.agents[i["kind"]].booking_state(i["booking_id"]) for i in co["items"]]
+        states = [await self.agents[i.get("agent") or i["kind"]].booking_state(i["booking_id"]) for i in co["items"]]
         if action == "cancel":
             if "confirmed" in states:
                 return [buttons_msg("This is already paid and confirmed, so I can't drop it here. Use My Bookings to cancel it.",
                                     [("menu:bookings", "📋 My Bookings"), ("nav:menu", "🏠 Menu")])]
-            for i in co["items"]:
-                await self.agents[i["kind"]].release_booking(i["booking_id"])
-            try:
-                await self.payments.cancel_link(co["link_id"])
-            except Exception:
-                logger.warning("Could not cancel the payment link %s", co["link_id"])
-            self._clear(s.ctx)
+            await self.abandon(s)
             s.step = "menu"
             return [buttons_msg("No problem, I've cancelled it and released everything. 👍", [("nav:menu", "🏠 Menu")])]
         # "I've paid"
@@ -212,7 +233,7 @@ class CheckoutAgent(Agent):
         out: list[dict] = []
         if paid:
             for i in co["items"]:
-                if result := await self.agents[i["kind"]].confirm_payment(co["link_id"]):
+                if result := await self.agents[i.get("agent") or i["kind"]].confirm_payment(co["link_id"]):
                     out += result[1]
         if not out:
             return [buttons_msg("I haven't received the payment yet. If you've just paid, give it a few seconds and tap again. 🙏",

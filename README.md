@@ -22,12 +22,13 @@ app/
   core/                        config, shared helpers (places, time utils, message builders)
   db/                          Supabase client + CoreRepo (users, conversations, messages)
   schemas/whatsapp.py          WhatsApp payload models
-  services/                    whatsapp_service.py (send/receive), razorpay_service.py (payment links, webhook check)
+  services/                    whatsapp_service.py (send/receive), razorpay_service.py (payment links, refunds, webhook check),
+                               duffel.py (live flights), hotelbeds.py (live hotels)
   agents/
     base.py                    Agent + Session contracts
     registry.py                wires every agent into the Concierge
     concierge/                 the router: concierge.py, router.py, classifiers.py, slots.py
-    flight/                    LIVE: agent.py, repo.py (flights/bookings), formatting.py
+    flight/                    LIVE (Duffel): agent.py, repo.py (mirrored flights/bookings), formatting.py, travellers.py (names + birth dates)
     cab/                       LIVE: agent.py, repo.py (places/fares/drivers/rides), pricing.py
     hotel/                     LIVE: agent.py, repo.py (hotels/rooms/stays), formatting.py
     visa/                      LIVE: see "Visa assistant" below
@@ -61,12 +62,14 @@ Setup of the database and dummy data: see [supabase/README.md](supabase/README.m
 empty gets a 403, so nobody can send the bot fake messages. The Razorpay webhook is verified the same way with `RAZORPAY_WEBHOOK_SECRET`.
 
 ## Payments (Razorpay)
-Flight bookings are paid online. Tapping *Confirm* holds the seats on a `pending` booking and sends a Razorpay payment link
-(valid 20 minutes). When the link is paid the booking becomes `confirmed` and the ticket is sent on WhatsApp.
+Flight bookings are paid online. Tapping *Confirm* prices the flight again with the airline, holds it as a `pending` booking and
+sends a Razorpay payment link (valid 20 minutes). When the link is paid the booking becomes `confirmed`, **the airline ticket is issued
+through Duffel** and the ticket (with the airline's PNR) is sent on WhatsApp. If the airline refuses the ticket after payment, the booking
+is cancelled and the money is refunded on the same Razorpay payment automatically.
 - **Webhook (recommended):** Razorpay dashboard → Settings → Webhooks → URL `https://<your-ngrok-url>/webhook/razorpay`, active event **Payment Link → paid**.
   Put the secret you choose there in `.env` as `RAZORPAY_WEBHOOK_SECRET`.
 - **Without the webhook:** the *I've paid* button checks the payment with Razorpay, so bookings still confirm.
-- **Unpaid bookings:** a background task (started with the app) cancels them after the window and releases the seats.
+- **Unpaid bookings:** a background task (started with the app) cancels them after the window.
 - **No keys in `.env`:** bookings confirm instantly, no payment. With `rzp_test_` keys no real money moves.
 - Cabs are still pay-the-driver (cash or UPI).
 
@@ -81,7 +84,9 @@ a room choice (Standard / Deluxe / Suite), the guest name, a summary, and paymen
   voucher, *I've paid* is the backup, and the sweeper releases unpaid rooms. No keys in `.env`: stays confirm instantly.
 - **Cancellation:** from *My Stays*. Free until 24 hours before check-in (2 PM); after that no refund is shown.
   The bot only tells the user a refund is initiated: no Razorpay refund is triggered yet.
-- **Data:** dummy hotels (44 hotels, 124 rooms, 11 cities) from `supabase/seed/hotel_data.py`. Prices are indicative.
+- **Data:** live from Hotelbeds (`app/services/hotelbeds.py`): search, photos and amenities, booking and cancelling. Every city in the
+  `airports` table (with coordinates) can be searched. Keys: `HOTELBEDS_API_KEY`, `HOTELBEDS_SECRET` in `.env`. The hotels and rooms tables
+  are only a mirror of what Hotelbeds returned, so bookings and payments have rows to point at.
 
 ## Buddy (a friend for any problem)
 `agents/buddy/` is the catch-all: when a message isn't a travel request (feelings, a worry, advice, chit-chat), the Concierge
@@ -137,7 +142,20 @@ hotel (with the right number of nights), cab and events** using the same queue a
   questions about a booked trip ("traffic mein fas gaya, flight miss na ho jaye") stay with Buddy; only clear booking requests
   ("book a flight to Goa") open the booking flow.
 - **Not built yet:** proactive nudges ("time to leave", "did you reach?"), which need a scheduler and WhatsApp message templates outside
-  the 24-hour window; gate and terminal info; real-time flight status (we only know the status stored in our own `flights` table).
+  the 24-hour window; gate and terminal info; real-time flight status (Duffel gives schedules and fares, not live delays).
+
+## Flights (Duffel)
+Flights are live, there is no timetable in our database. `app/services/duffel.py` searches any airport pair for a day, and every
+search is mirrored into the `flights` table so bookings have a row to point at (old unbooked offers are pruned by `prune_flights()`).
+- **Keys:** `DUFFEL_API_TOKEN` in `.env`. `duffel_test_…` uses Duffel's sandbox (fake airlines, no money); `duffel_live_…` issues real tickets
+  and charges your Duffel balance. `DUFFEL_MARKUP_PCT` adds your margin. Fares come in the airline's currency and are shown in rupees per traveller.
+- **Cities:** any airport in the `airports` table can be searched; add a row (code, city, name, country, lat, lon) to open a new city.
+- **Travellers:** the airline needs each traveller's name, date of birth and gender. They are asked once in one message
+  (*"Rahul Verma, 14/03/1992, M"*) and remembered in `users.preferences.travellers`. Offers that need passport details are not shown.
+- **Booking:** the offer is re-priced at checkout (a dearer fare counts as sold out, a few rupees more are absorbed), the ticket is issued
+  after payment, and cancelling asks the airline for its refund first, then refunds the traveller their share through Razorpay.
+- **Not covered yet:** Duffel returns few Indian low-cost carriers (IndiGo, SpiceJet…); an India-domestic supplier (e.g. Tripjack, TBO) would sit
+  next to Duffel behind the same `live` interface.
 
 ## Visa assistant
 `agents/visa/` walks a user through a visa on WhatsApp: destination, purpose and dates, then whether a visa is needed

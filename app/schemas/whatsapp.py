@@ -13,6 +13,7 @@ class MessageInfo(BaseModel):
     image: Optional[Dict[str, Any]] = None        # {id, mime_type, caption}
     document: Optional[Dict[str, Any]] = None     # {id, mime_type, filename, caption}
     video: Optional[Dict[str, Any]] = None        # {id, mime_type, caption}
+    audio: Optional[Dict[str, Any]] = None        # {id, mime_type}
     location: Optional[Dict[str, Any]] = None     # {latitude, longitude, name, address}
     type: str
 

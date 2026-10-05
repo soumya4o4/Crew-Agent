@@ -9,6 +9,12 @@ from app.core.config import settings
 API = "https://api.razorpay.com/v1"
 
 
+def clean(text: str) -> str:
+    """Razorpay's database rejects 4-byte characters (most emoji, like the hotel sign) with "Conversion from collation
+    ... impossible", so they must not reach it. Everything else (accents, arrows, rupee sign) is fine."""
+    return " ".join("".join(c for c in text if ord(c) <= 0xFFFF and c != "️").split())
+
+
 class RazorpayService:
     @staticmethod
     def configured() -> bool:
@@ -29,8 +35,8 @@ class RazorpayService:
             "amount": amount_inr * 100,  # paise
             "currency": "INR",
             "reference_id": reference_id,
-            "description": description[:255],
-            "customer": {"contact": phone, **({"name": name} if name else {}), **({"email": email} if email else {})},
+            "description": clean(description)[:255],
+            "customer": {"contact": phone, **({"name": clean(name)} if name else {}), **({"email": email} if email else {})},
             "notify": {"sms": False, "email": False},  # we deliver the link on WhatsApp ourselves
             "expire_by": int(time.time()) + max(expire_minutes, 16) * 60,
         }
@@ -76,3 +82,17 @@ class RazorpayGateway:
     async def cancel_link(self, link_id: str) -> None:
         async with httpx.AsyncClient(timeout=15) as http:
             await http.post(f"{API}/payment_links/{link_id}/cancel", auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+
+    async def refund(self, link_id: str, amount_inr: int) -> bool:
+        """Give `amount_inr` back to whoever paid this link (a link can hold several bookings, so it is a partial refund).
+        False if there was no captured payment to refund."""
+        auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+        async with httpx.AsyncClient(timeout=15) as http:
+            link = await http.get(f"{API}/payment_links/{link_id}", auth=auth)
+            link.raise_for_status()
+            payment = next((p for p in link.json().get("payments") or [] if p.get("status") == "captured"), None)
+            if not payment:
+                return False
+            resp = await http.post(f"{API}/payments/{payment['payment_id']}/refund", json={"amount": amount_inr * 100, "speed": "normal"}, auth=auth)
+            resp.raise_for_status()
+        return True

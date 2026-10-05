@@ -21,8 +21,8 @@ from app.core.places import CITIES, city
 logger = logging.getLogger(__name__)
 ANALYZE_TIMEOUT_S, PLAN_TIMEOUT_S = 60, 30
 ACK = "🎬 Got your reel! Taking a look, this takes 20-30 seconds ⏳"
-SHARE_HELP = ("Send an Instagram, YouTube or TikTok reel *link*, or the reel's *video* / *screenshot*. "
-              "Or just tell me where you want to go, like *Goa 3 days*.")
+SHARE_HELP = ("Where would you like to travel, and for how many days? (e.g. *Tokyo 5 days* or *Goa 3 days*).\n\n"
+              "Or send an Instagram, YouTube or TikTok reel link to turn it into an itinerary.")
 MSG_NEED_MORE = ("I couldn't read the caption from this link (Instagram often blocks it). 🙏 Please send the reel's *video* or "
                  "a *screenshot*, or just type where it is.")
 MSG_NOT_FOUND = "🤔 I couldn't tell the place from this reel. Send a *screenshot*, or just type the place name, like *Munnar*."
@@ -70,15 +70,49 @@ class PlannerAgent(Agent):
     async def on_enter(self, s: Session) -> list[dict]:
         self.reset(s)
         s.ctx["agent"], s.step = "planner", "planner_wait"
-        return [text_msg(f"🗺️ *Trip Planner*\n{SHARE_HELP}\n\nI will find the place, plan it day by day, and you can book flights, hotels and cabs right here.")]
+        return [text_msg(f"🗺️ *Trip Planner*\n\n{SHARE_HELP}\n\nI can plan your itinerary day-by-day and help you coordinate flights, stays and cabs.")]
 
     async def start(self, s: Session, slots: dict) -> list[dict]:
-        """Free text like "plan a trip to Goa": a city we know skips the reel."""
-        code = slots.get("to")
-        if code not in CITIES:
-            return await self.on_enter(s)
-        s.ctx["agent"] = "planner"
-        return self._show(s, Insight(label=city(code), city_code=code, confidence="high"))
+        """Free text like 'plan a trip to Goa' or multi-service 'plan everything flight and hotel and cab'."""
+        c = s.ctx
+        trip = c.get("trip") or {}
+        dest = slots.get("to") or slots.get("unknown_to") or trip.get("to") or trip.get("city") or c.get("to")
+        orig = slots.get("from") or trip.get("from") or c.get("from")
+        
+        has_flight = bool(c.get("flight_id") or c.get("flight_summary") or trip.get("flight_no") or trip.get("summary"))
+        flight_sum = c.get("flight_summary") or trip.get("summary") or ""
+        pax_names = c.get("names") or trip.get("names") or []
+
+        text_low = (slots.get("text") or "").lower()
+        is_bundle = any(w in text_low for w in ("everything", "flight and hotel", "hotel and cab", "flight hotel", "airport", "bundle", "all"))
+
+        # Contextual multi-service bundle coordination
+        if (has_flight and (is_bundle or dest)) or (dest and is_bundle):
+            dest_name = city(dest) if dest in CITIES else dest
+            pax_str = f" for {', '.join(pax_names)}" if pax_names else ""
+            flt_line = f"1. ✈️ *Flight*: {flight_sum}{pax_str} (selected & ready to confirm)" if flight_sum else f"1. ✈️ *Flight*: {city(orig) if orig else 'Origin'} ➜ {dest_name}"
+            hotel_line = f"2. 🏨 *Hotel*: Finding top-rated stays in {dest_name} for your dates"
+            cab_line = f"3. 🚕 *Airport Cab*: Transfer from {dest_name} airport directly to your hotel"
+
+            body = (
+                f"🗺️ *Complete {dest_name} Trip Plan*\n\n"
+                f"I've bundled your entire trip together:\n\n"
+                f"{flt_line}\n"
+                f"{hotel_line}\n"
+                f"{cab_line}\n\n"
+                f"Shall we confirm your flight first to lock in your seats, or explore hotel options right away?"
+            )
+            s.ctx["agent"] = "planner"
+            return [text_msg(body)]
+
+        # If a destination is known (domestic or international)
+        if dest:
+            s.ctx["agent"] = "planner"
+            label = city(dest) if dest in CITIES else dest
+            city_code = dest if dest in CITIES else None
+            return self._show(s, Insight(label=label, city_code=city_code, confidence="high"))
+
+        return await self.on_enter(s)
 
     async def process(self, s: Session, text: str, reply_id: str | None) -> list[dict]:
         s.ctx["agent"] = "planner"
@@ -90,6 +124,7 @@ class PlannerAgent(Agent):
         if text and s.step in ("planner_wait", "planner_fix"):
             return await self._run(s, text=text, inline=True, named=True)  # a few words are quick to read: no background job
         return await self.on_enter(s)
+
 
     async def on_media(self, s: Session, media: dict, caption: str) -> list[dict]:
         s.ctx["agent"] = "planner"

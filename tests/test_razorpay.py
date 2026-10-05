@@ -34,3 +34,24 @@ def test_create_payment_link_sends_paise_and_reference(monkeypatch):
     assert link == {"id": "plink_1", "short_url": "https://rzp.io/i/abc"}
     assert seen["body"]["amount"] == 431000 and seen["body"]["reference_id"] == "FO3K35"
     assert seen["auth"].startswith("Basic ") and RazorpayService.is_test_mode()
+
+
+def test_payment_link_text_has_no_emoji_razorpay_rejects():
+    """Razorpay answers 400 "Conversion from collation ... impossible" to 4-byte characters like the hotel emoji."""
+    import asyncio, json
+    import httpx
+    from app.services.razorpay_service import RazorpayService, clean
+
+    assert clean("🏨 Ar Suites - Pune, 03 Oct ➜ 05 Oct + ✈️ Indore ➜ Goa") == "Ar Suites - Pune, 03 Oct ➜ 05 Oct + ✈ Indore ➜ Goa"
+    sent = {}
+
+    def handler(request):
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, json={"id": "plink_1", "short_url": "https://rzp.io/i/x"})
+
+    async def run():
+        return await RazorpayService.create_payment_link(100, "HB1", "🏨 Hotel Taj ➜ stay", "+919876543210", "Aarav 🙂",
+                                                         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    asyncio.run(run())
+    assert sent["description"] == "Hotel Taj ➜ stay" and sent["customer"]["name"] == "Aarav"

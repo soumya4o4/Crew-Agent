@@ -4,6 +4,7 @@ Nothing about cities is written down here: airports come from the `airports` tab
 so a new city or country in the database is understood everywhere with no code change. What stays in code is language,
 not geography: other names people use for a place ("bombay"), and visa-country spellings ("europe" -> Schengen).
 """
+import difflib
 import re
 
 CITIES: dict[str, str] = {}           # airport code -> city name
@@ -65,6 +66,16 @@ def city_pattern() -> re.Pattern:
         names = sorted(map(re.escape, CITY_ALIASES), key=len, reverse=True)
         _city_re = (_version, re.compile(r"\b(" + "|".join(names) + r")\b" if names else r"(?!x)x"))
     return _city_re[1]
+
+
+def fuzzy_city(name: str) -> str | None:
+    """Airport code for a misspelt place ("ahemdabad", "bangalor"). Only for text we already know is meant as a city,
+    never for free text: "indoor" would become Indore."""
+    low = " ".join((name or "").lower().replace(",", " ").split())
+    if len(low) < 4:
+        return None
+    close = difflib.get_close_matches(low, CITY_ALIASES, n=1, cutoff=0.8)
+    return CITY_ALIASES[close[0]] if close else None
 
 
 def find_city(text: str) -> str | None:

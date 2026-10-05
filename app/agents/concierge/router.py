@@ -22,8 +22,5 @@ class IntentRouter:
     async def classify(self, text: str, history: list[dict], active: str | None, trip: dict | None = None) -> Intent:
         today = now_ist().date()
         if self.llm:
-            try:
-                return await asyncio.wait_for(self.llm.classify(text, today, history, active, trip), LLM_TIMEOUT_S)
-            except Exception:
-                logger.exception("LLM routing failed, falling back to keywords")
-        return self.keywords.classify(text, today)
+            return await self.llm.classify(text, today, history, active, trip)
+        return self.keywords.classify(text, today, active)

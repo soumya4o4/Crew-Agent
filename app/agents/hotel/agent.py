@@ -17,12 +17,12 @@ from app.agents.flight.formatting import NEXT_STEPS, city_tip
 from app.agents.hotel.images import hotel_image
 from app.agents.hotel.nlu import parse_stay
 from app.agents.hotel.formatting import (STATUS_ICON, amenities_asked, amenity_answer, asks_amenities, cancel_policy, fmt_day, free_cancel_until, hotel_card,
-                                         hotel_card_short, hotel_row, hotel_tags, plural, room_row, stay_countdown,
+                                         hotel_card_short, hotel_row, hotel_tags, plural, rating_text, room_row, stay_countdown,
                                          stay_text)
 from app.core.geo import NEAR_ME, fresh_location, nearest_city
 from app.core.messages import (buttons_msg, cta_msg, image_msg, list_msg, location_request_msg, reaction_msg,
                                text_msg)
-from app.core.places import find_city, country_of, city
+from app.core.places import find_city, fuzzy_city, country_of, city
 from app.core.utils import IST, inr, now_ist, parse_date
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,8 @@ class HotelAgent(Agent):
     owns = frozenset({"hotel", "hcity", "hin", "hnt", "hgst", "htl", "hroom", "hname", "hcfm", "hpay", "hbk", "hbkc",
                       "hbkcy", "hact"})
 
-    def __init__(self, repo, payments=None, advisor=None):
+    def __init__(self, repo, payments=None, advisor=None, live=None):
+        self.live = live          # HotelbedsClient (or None: only the hotels in our own database)
         self.repo = repo          # HotelRepo
         self.payments = payments  # RazorpayGateway (or None: stays confirm instantly)
         self.advisor = advisor    # TravelAdvisor (or None: a plain tip)
@@ -101,24 +102,50 @@ class HotelAgent(Agent):
             h["nights"] = said["nights"]
         if 1 <= said.get("guests", 0) <= MAX_GUESTS:
             h["guests"] = said["guests"]
+        if slots.get("max_budget"):
+            h["max_budget"] = slots["max_budget"]
         if slots.get("near_me") and not h.get("city"):
             s.ctx["hotel"] = h
             return await self._near_me(s)
-        if not h:
-            return await self.on_enter(s)
+        if (place := slots.get("unknown_to")) and not h.get("city"):  # a place we cannot search, said in a hotel request
+            s.ctx["hotel"] = h
+            return [text_msg(f"I don't have direct hotel inventory in *{place.title()}* yet, but you can explore stays here:\n🏨 https://www.expedia.co.in/Hotels")]
+        if not h.get("city") and not h.get("check_in") and not h.get("nights") and not h.get("guests"):
+            # Empty state
+            h.update({
+                "service": "hotel",
+                "destination": None,
+                "check_in": None,
+                "check_out": None,
+                "adults": None,
+                "children": 0,
+                "rooms": None,
+                "budget_per_night": None,
+                "currency": None,
+                "selected_hotel": None,
+                "payment_status": None,
+                "booking_status": None
+            })
+            s.ctx["hotel"] = h
+            return await self._ask_city(s)
+            
         s.ctx["hotel"] = h
         heard = " ".join(x for x in (f"in {city(h['city'])}" if h.get("city") else "",
                                      f"from {fmt_day(h['check_in'])}" if h.get("check_in") else "",
                                      plural(h["nights"], "night") if h.get("nights") else "",
                                      plural(h["guests"], "guest") if h.get("guests") else "") if x)
-        return [text_msg(f"Got it! 🏨 A stay {heard}.")] + await self._advance(s)
+        return [text_msg(f"🏨 Checking stays {heard}...")] + await self._advance(s)
 
     async def process(self, s: Session, text: str, reply_id: str | None) -> list[dict]:
         return await (self._on_reply(s, reply_id) if reply_id else self._on_text(s, text.strip()))
 
     # ---------------------------------------------------------------------- helpers
+    async def _cities(self) -> list[dict]:
+        """Cities to search: with Hotelbeds any city we have coordinates for, otherwise only where our own hotels are."""
+        return await self._db(self.repo.list_airport_cities if self.live else self.repo.list_hotel_cities)
+
     async def _hotel_cities(self) -> set[str]:
-        return {c["code"] for c in await self._db(self.repo.list_hotel_cities)}
+        return {c["code"] for c in await self._cities()}
 
     @staticmethod
     def _in_range(d: date) -> bool:
@@ -136,7 +163,8 @@ class HotelAgent(Agent):
     @staticmethod
     def _stay(h: dict) -> tuple[date, date]:
         check_in = date.fromisoformat(h["check_in"])
-        return check_in, check_in + timedelta(days=h["nights"])
+        check_out = date.fromisoformat(h["check_out"]) if h.get("check_out") else check_in + timedelta(days=h["nights"])
+        return check_in, check_out
 
     def _home(self, s: Session, note: str) -> list[dict]:
         self.reset(s)
@@ -160,16 +188,81 @@ class HotelAgent(Agent):
             said = parse_stay(text, now_ist().date())
             if any(k in said for k in ("city", "check_in", "nights", "guests")):
                 return await self._on_details_text(s, text)
+                
+        if self.advisor:
+            if res := await self._ask_llm_assistant(s, text):
+                return res
+                
         return await self._on_more_text(s, text)
+
+    async def _ask_llm_assistant(self, s: Session, text: str) -> list[dict] | None:
+        """Consult TravelAdvisor LLM when user sends free text during hotel selection or booking."""
+        if not self.advisor or not hasattr(self.advisor, "evaluate_stay_intent"):
+            return None
+        h = s.ctx.get("hotel") or {}
+        hotel_sum = ""
+        if h.get("hotel_id"):
+            found = await self._db(self.repo.get_hotel, h["hotel_id"])
+            if found:
+                hotel_sum = f"{found['name']} · {city(h.get('city', ''))}"
+        lang = "Hinglish" if s.ctx.get("hinglish") else "professional English"
+
+        res = await self.advisor.evaluate_stay_intent(s.step, hotel_sum, text, lang)
+        if not res:
+            return None
+
+        intent, reply, action = res.get("intent"), res.get("reply", ""), res.get("action", "none")
+
+        if intent == "confirm" or action == "book":
+            if s.step == "awaiting_hotel_confirm":
+                return await self._on_reply(s, "hcfm:yes")
+            if s.step == "awaiting_hotel_room" and h.get("room_id"):
+                return self._ask_guest(s)
+
+        if intent == "cancel" or action == "cancel":
+            return await self._on_reply(s, "hcfm:no")
+
+        if action == "web_search" and res.get("query"):
+            intermediate_msg = reply or ("Ek sec bhai, main check karke batata hoon..." if lang == "Hinglish" else "One moment, let me check that for you...")
+            try:
+                from app.services.whatsapp_service import WhatsAppService
+                await WhatsAppService.send(s.phone, text_msg(intermediate_msg))
+            except Exception:
+                pass
+            try:
+                from tavily import TavilyClient
+                from app.core.config import settings
+                def _do_search():
+                    if not settings.TAVILY_API_KEY:
+                        raise ValueError("TAVILY_API_KEY is missing")
+                    client = TavilyClient(api_key=settings.TAVILY_API_KEY)
+                    return client.search(res["query"], search_depth="basic", max_results=3).get("results", [])
+                results = await self._db(_do_search)
+                search_text = "\n".join(f"- {r['title']}: {r.get('content', '')}" for r in results) if results else "No results found."
+                follow_up = f"System: Web search results for '{res['query']}':\n{search_text}\n\nNow, answer the user's question naturally using these facts."
+                res2 = await self.advisor.evaluate_stay_intent(s.step, hotel_sum, text + "\n\n" + follow_up, lang)
+                if res2 and res2.get("reply"):
+                    return [text_msg(res2["reply"])]
+            except Exception as e:
+                logger.exception(f"Web search failed: {e}")
+                fail_msg = "Ek sec bhai, abhi search nahi ho raha. Thodi der mein dobara try karte hain." if lang == "Hinglish" else "Sorry, I couldn't search the web right now."
+                return [text_msg((reply + "\n\n" + fail_msg) if reply else fail_msg)]
+
+        if reply:
+            return [text_msg(reply)]
+
+        return None
 
     async def _on_details_text(self, s: Session, text: str) -> list[dict]:
         """Any answer can fill several details at once ("2 nights from tomorrow for 3"); then we ask for what is missing."""
         h = s.ctx.setdefault("hotel", {})
         asking = s.step
         said = parse_stay(text, now_ist().date(), {"awaiting_hotel_nights": "nights", "awaiting_hotel_guests": "guests"}.get(asking))
-        cities = {c["code"]: c["city"] for c in await self._db(self.repo.list_hotel_cities)}
+        cities = {c["code"]: c["city"] for c in await self._cities()}
         if said.get("near_me") and asking in ("awaiting_hotel_city", "awaiting_hotel_loc"):
             return await self._near_me(s)
+        if "city" not in said and asking in ("awaiting_hotel_city", "awaiting_hotel_loc") and (code := fuzzy_city(text)):
+            said["city"] = code  # they were asked for a city, so a typo like "ahemdabad" is one
         notes: list[str] = []
         if code := said.get("city"):
             if code in cities:
@@ -185,16 +278,24 @@ class HotelAgent(Agent):
                 notes.append("😕 I don't have stays there yet. I can book in: " + ", ".join(sorted(cities.values())) + ".")
         if d := said.get("check_in"):
             if self._in_range(date.fromisoformat(d)):
+                if h.get("check_in") != d:
+                    h.pop("page", None), h.pop("hotel_id", None), h.pop("room_id", None)
                 h["check_in"] = d
             else:
                 notes.append("😕 That date is out of range. I can book stays within the next 30 days.")
+        if out := said.get("check_out"):
+            h["check_out"] = out
         if n := said.get("nights"):
             if 1 <= n <= MAX_NIGHTS:
+                if h.get("nights") != n:
+                    h.pop("page", None), h.pop("hotel_id", None), h.pop("room_id", None)
                 h["nights"] = n
             else:
                 notes.append(f"😕 I can book between 1 and {MAX_NIGHTS} nights.")
         if g := said.get("guests"):
             if 1 <= g <= MAX_GUESTS:
+                if h.get("guests") != g:
+                    h.pop("page", None), h.pop("hotel_id", None), h.pop("room_id", None)
                 h["guests"] = g
             else:
                 notes.append(f"😕 I can book for 1 to {MAX_GUESTS} guests.")
@@ -347,8 +448,8 @@ class HotelAgent(Agent):
     # ------------------------------------------------------------------ search steps
     async def _ask_city(self, s: Session) -> list[dict]:
         s.step = "awaiting_hotel_city"
-        names = sorted(c["city"] for c in await self._db(self.repo.list_hotel_cities))
-        return [text_msg("🏙️ *Which city do you need a stay in?*\nI can book in: " + ", ".join(names) + ".\n"
+        names = sorted(c["city"] for c in await self._cities())
+        return [text_msg("Sure! 🏨 Which city or destination do you need the hotel in?\nI can book in: " + ", ".join(names) + ".\n"
                          "Just tell me in your own words, like *2 nights in Goa from tomorrow for 2 people*, "
                          "or share your location for stays near you.")]
 
@@ -383,7 +484,20 @@ class HotelAgent(Agent):
     # -------------------------------------------------------------------- results
     async def _search(self, h: dict) -> list[dict]:
         check_in, check_out = self._stay(h)
-        return await self._db(self.repo.search_hotels, h["city"], check_in, check_out, h["guests"])
+        live_ids = await self._live_ids(h["city"], check_in, check_out, h["guests"])
+        found = await self._db(self.repo.search_hotels, h["city"], check_in, check_out, h["guests"])
+        return found if live_ids is None else [x for x in found if x["id"] in live_ids]
+
+    async def _live_ids(self, city_code: str, check_in: date, check_out: date, guests: int) -> set[str] | None:
+        """Ask Hotelbeds and mirror what it returns into our tables. None = no live search (not set up, or it failed),
+        so we fall back to the hotels we already hold."""
+        if self.live is None:
+            return None
+        try:
+            return await self._db(self.repo.sync_live_hotels, city_code, await self.live.search(city_code, check_in, check_out, guests))
+        except Exception:
+            logger.exception("Hotelbeds search failed, using our own hotels")
+            return None
 
     async def _show_results(self, s: Session) -> list[dict]:
         h = s.ctx["hotel"]
@@ -391,10 +505,25 @@ class HotelAgent(Agent):
             h.pop("check_in")
             return self._ask_date(s)
         check_in, check_out = self._stay(h)
+        
+        # Idempotency check: don't process duplicate retries for the same search + message
+        req_id = f"{h.get('city')}:{check_in}:{check_out}:{h.get('guests')}:{h.get('page', 0)}"
+        if h.get("last_search_req") == req_id and h.get("last_search_msg") == s.msg_id:
+            return []
+            
         hotels = sorted(await self._search(h), key=lambda x: x["rooms"][0]["price_inr"])
+        
+        h["last_search_req"] = req_id
+        h["last_search_msg"] = s.msg_id
+        
+        if h.get("max_budget"):
+            hotels = [x for x in hotels if x["rooms"][0]["price_inr"] <= h["max_budget"]]
+            
         if not hotels:
             s.step = "hotel_menu"
-            return [buttons_msg(f"😕 No rooms free in {city(h['city'])} for {fmt_day(check_in)} to {fmt_day(check_out)} "
+            msg = (f"😕 No rooms found under {inr(h['max_budget'])} in {city(h['city'])}" if h.get("max_budget") 
+                   else f"😕 No rooms free in {city(h['city'])}")
+            return [buttons_msg(f"{msg} for {fmt_day(check_in)} to {fmt_day(check_out)} "
                                 f"with {plural(h['guests'], 'guest')}. Try other dates?",
                                 [("hact:dates", "📅 Other dates"), ("hact:city", "🏙️ Other city"), ("nav:menu", "🏠 Menu")])]
         tags = hotel_tags(hotels)
@@ -410,13 +539,13 @@ class HotelAgent(Agent):
             more = [("hact:more", f"➡️ More ({page + 1}/{pages})", "See the next stays")]
             if page == 0:  # everything at a glance, then the list to pick from
                 out.append(text_msg(f"🏨 *All {len(hotels)} stays in {city(h['city'])}* (cheapest first)\n" + "\n".join(
-                    f"{i}. {x['name']} · {x['stars']}★ · ⭐ {x['rating']} · from {inr(x['rooms'][0]['price_inr'])}"
+                    f"{i}. {x['name']} · {x['stars']}★ · {rating_text(x)}from {inr(x['rooms'][0]['price_inr'])}"
                     for i, x in enumerate(hotels, 1))))
         rows = [hotel_row(x, tags[x["id"]]) for x in shown] + more + [("nav:menu", "🏠 Main menu", "")]
         return out + [list_msg(
             f"🏨 *{city(h['city'])}* · {fmt_day(check_in)} ➜ {fmt_day(check_out)} ({plural(h['nights'], 'night')}, "
             f"{plural(h['guests'], 'guest')})\nFound *{len(hotels)}* stays{extra}, from just "
-            f"*{inr(hotels[0]['rooms'][0]['price_inr'])}* a night.\nPick one 👇", "View hotels", rows, "Available stays")]
+            f"*{inr(hotels[0]['rooms'][0]['price_inr'])}* a night.\n\nWant to see more? 🔗 https://www.expedia.co.in/Hotels\n\nPick one from our list 👇", "View hotels", rows, "Available stays")]
 
     async def _show_hotel(self, s: Session, hotel_id: str) -> list[dict]:
         h = s.ctx["hotel"]
@@ -483,13 +612,20 @@ class HotelAgent(Agent):
         hotel, room = await self._db(self.repo.get_hotel, h["hotel_id"]), await self._db(self.repo.get_room, h["room_id"])
         check_in, check_out = self._stay(h)
         if self.checkout is not None and self.checkout.online:  # paid online: into the bundle, held only at checkout
+            summary_text = (f"🏨 {hotel['name']}\n"
+                            f"📍 {hotel['city'].title() if hotel.get('city') else 'City'}\n"
+                            f"📅 {fmt_day(check_in)} ➜ {fmt_day(check_out)} · {plural(h['nights'], 'night')}\n"
+                            f"👥 {plural(h['guests'], 'adult')} · 1 room\n"
+                            f"🛏️ {room['room_type']}")
             item = {"kind": "hotel", "hotel_id": hotel["id"], "room_id": room["id"], "name": h["name"], "guests": h["guests"],
                     "check_in": check_in.isoformat(), "check_out": check_out.isoformat(), "amount": room["price_inr"] * h["nights"],
-                    "label": f"🏨 {hotel['name']}, {fmt_day(check_in)} ➜ {fmt_day(check_out)}"}
+                    "label": f"🏨 {hotel['name']}, {fmt_day(check_in)} ➜ {fmt_day(check_out)}",
+                    "summary_text": summary_text}
             self.reset(s)
             return await self.checkout.add(s, item, {"to": hotel["city_code"], "date": check_in.isoformat()})
         booking = await self._db(self.repo.create_booking, s.user["id"], hotel, room, h["name"], h["guests"], check_in,
                                  check_out, "confirmed")
+        booking = await self._book_supplier(booking, room)
         if not booking:
             s.step = "awaiting_hotel_pick"
             return [buttons_msg("😕 Sorry, that room was just taken. Want to see other hotels?",
@@ -503,8 +639,9 @@ class HotelAgent(Agent):
         hotel, room = await self._db(self.repo.get_hotel, item["hotel_id"]), await self._db(self.repo.get_room, item["room_id"])
         if not hotel or not room:
             return None
-        return await self._db(self.repo.create_booking, s.user["id"], hotel, room, item["name"], item["guests"],
-                              date.fromisoformat(item["check_in"]), date.fromisoformat(item["check_out"]), "pending")
+        booking = await self._db(self.repo.create_booking, s.user["id"], hotel, room, item["name"], item["guests"],
+                                 date.fromisoformat(item["check_in"]), date.fromisoformat(item["check_out"]), "pending")
+        return await self._book_supplier(booking, room)
 
     async def attach_payment(self, s: Session, booking: dict, link: dict, expires_at: datetime) -> None:
         await self._db(self.repo.create_payment, booking["id"], s.user["id"], booking["total_price_inr"], link["id"],
@@ -514,7 +651,20 @@ class HotelAgent(Agent):
         b = await self._db(self.repo.get_booking_with_user, booking_id)
         if b:
             await self._db(self.repo.cancel_payment, b["id"])
-            await self._db(self.repo.cancel_booking, b)
+            await self._cancel(b)
+
+    async def _book_supplier(self, booking: dict | None, room: dict) -> dict | None:
+        """Internal Booking: We do not call Hotelbeds to book/issue a reservation. The DB is the source of truth."""
+        return booking
+
+    async def _cancel_supplier(self, b: dict) -> bool:
+        """Internal Booking: We do not call Hotelbeds to cancel. The DB is the source of truth."""
+        return True
+
+    async def _cancel(self, b: dict) -> bool:
+        """Give a stay up: cancel it at Hotelbeds (best effort) and free the room here."""
+        await self._cancel_supplier(b)
+        return await self._db(self.repo.cancel_booking, b)
 
     async def booking_state(self, booking_id: str) -> str | None:
         b = await self._db(self.repo.get_booking_with_user, booking_id)
@@ -530,7 +680,8 @@ class HotelAgent(Agent):
         nxt = queue[0] if queue else "cab"
         ask = (f"\n\nYou also mentioned {NEXT_STEPS[nxt][1]}. Shall we do that next?" if queue
                else "\n\nNeed a ride to the hotel?")
-        out = [image_msg(hotel_image(h), f"🎉 *Stay Confirmed!*\n━━━━━━━━━━━━━━━\n{stay_text(b)}"),
+        title = "🎉 *Stay Confirmed!*" if b.get("hb_reference") else "💳 *Payment received!*\nYour hotel booking has been recorded successfully."
+        out = [image_msg(hotel_image(h), f"{title}\n━━━━━━━━━━━━━━━\n{stay_text(b)}"),
                buttons_msg(f"{stay_countdown(b['check_in'])}\n{cancel_policy(b['check_in'])}\n🪪 Carry a valid photo ID at check-in.\n\n"
                            f"💡 *{city(h['city_code'])} tip:* {tip}{ask}",
                            [("hotel:stays", "📋 My Stays"), (f"svc:{nxt}", NEXT_STEPS[nxt][0]), ("nav:menu", "🏠 Menu")])]
@@ -573,7 +724,7 @@ class HotelAgent(Agent):
                 return [buttons_msg("This stay is already paid and confirmed, so I can't drop it here. Use *My Stays* to cancel it.",
                                     [("hotel:stays", "📋 My Stays"), ("nav:menu", "🏠 Menu")])]
             await self._db(self.repo.cancel_payment, b["id"])
-            await self._db(self.repo.cancel_booking, b)
+            await self._cancel(b)
             try:
                 await self.payments.cancel_link(pay["link_id"])
             except Exception:
@@ -616,6 +767,8 @@ class HotelAgent(Agent):
     async def release_expired(self) -> list[tuple[str, list[dict]]]:
         """Sweeper: cancel stays nobody paid for in time. Returns (whatsapp number, messages) to notify."""
         expired = await self._db(self.repo.expire_unpaid, datetime.now(IST))
+        for b in expired:
+            await self._cancel_supplier(b)
         return [(b["users"]["phone"].lstrip("+"),
                  [buttons_msg(f"⌛ The payment window for your stay at *{b['hotels']['name']}* ended, so I've released the room. "
                               "Want to try again?", [("hotel:find", "🏨 Find a Hotel"), ("nav:menu", "🏠 Menu")])]) for b in expired]
@@ -665,6 +818,9 @@ class HotelAgent(Agent):
         b = await self._db(self.repo.get_booking, booking_id, s.user["id"])
         if not b or not self._can_cancel(b):
             return await self.on_enter(s)
+        if not await self._cancel_supplier(b):  # Hotelbeds refused: keep the stay rather than say it is cancelled
+            return [buttons_msg("😕 I couldn't cancel that with the hotel right now. Your stay is still booked, please try again in a few minutes.",
+                                [(f"hbk:{b['id']}", "↩️ My stay"), ("nav:menu", "🏠 Menu")])]
         free = now_ist() <= free_cancel_until(b["check_in"])
         await self._db(self.repo.cancel_booking, b)
         refund = (f"💸 Your {inr(b['total_price_inr'])} refund has been initiated." if free

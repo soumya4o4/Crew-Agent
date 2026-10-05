@@ -23,12 +23,47 @@ def parse_stay(text: str, today: date, expecting: str | None = None) -> dict:
         found["city"] = code
     elif NEAR_ME.search(t):
         found["near_me"] = True
-    if d := extract_date(t, today):
-        found["check_in"] = d
-    if m := NIGHTS.search(t):
+
+    # Try to extract a date range first
+    range_match = re.search(r"(.+?)(?:\bto\b|\btill\b|\band\b|[-])(?:\s*check\s*out)?\s*(.+)", t)
+    d1, nights_from_range = None, None
+    if range_match:
+        d1 = extract_date(range_match.group(1), today)
+        if d1:
+            d1_date = date.fromisoformat(d1)
+            d2 = extract_date(range_match.group(2), d1_date)
+            if not d2:
+                m2 = re.search(r"\b(\d{1,2})\b", range_match.group(2))
+                if m2:
+                    try:
+                        day2 = int(m2.group(1))
+                        d2_date = d1_date.replace(day=day2)
+                        if d2_date <= d1_date:
+                            if d1_date.month == 12:
+                                d2_date = d2_date.replace(year=d1_date.year + 1, month=1)
+                            else:
+                                d2_date = d2_date.replace(month=d1_date.month + 1)
+                        d2 = d2_date.isoformat()
+                    except ValueError:
+                        pass
+            if d2:
+                d2_date = date.fromisoformat(d2)
+                nights_from_range = (d2_date - d1_date).days
+                found["check_out"] = d2
+
+    if not d1:
+        d1 = extract_date(t, today)
+
+    if d1:
+        found["check_in"] = d1
+        
+    if nights_from_range and nights_from_range > 0:
+        found["nights"] = nights_from_range
+    elif m := NIGHTS.search(t):
         found["nights"] = int(m[1])
     elif m := DAYS.search(t):  # "3 days" in a trip means 2 nights
         found["nights"] = max(1, int(m[1]) - 1)
+
     if m := GUESTS.search(t):
         found["guests"] = int(m[1] or m[2])
     else:

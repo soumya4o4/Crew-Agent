@@ -44,11 +44,13 @@ class GuideRepo:
         return self.visa.get_rule(visa_code, "tourist")
 
     def popular_destinations(self, limit: int = 3) -> list[str]:
-        """Airport codes people fly to most (a fallback when there is no AI to suggest places)."""
+        """Airport codes people fly to most, then the other airports we know (a fallback when there is no AI to suggest places).
+        Flights are live, so every airport in our table can be booked."""
         out: list[str] = []
         for _, to in self.flights.popular_routes(12):
             if to not in out:
                 out.append(to)
+        out += [a["code"] for a in self.flights.list_airports() if a["code"] not in out]
         return out[:limit]
 
     def progress(self, user_id: str, *, dest_code: str | None, origin_code: str | None, travel: date, back: date | None,

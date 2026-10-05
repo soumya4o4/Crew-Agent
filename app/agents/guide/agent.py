@@ -93,8 +93,12 @@ class GuideAgent(Agent):
         """Free text like "help me plan a trip to Goa": a known place skips the where question."""
         self.reset(s)
         s.ctx["gtmp"] = {}
-        if (code := slots.get("to")) in CITIES:
-            s.ctx["gtmp"]["dest"] = self._dest(city(code), country_of(code), code)
+        place = slots.get("to") or slots.get("unknown_to")
+        if place:
+            if place in CITIES:
+                s.ctx["gtmp"]["dest"] = self._dest(city(place), country_of(place), place)
+            else:
+                s.ctx["gtmp"]["dest"] = await self._resolve(place)
             return await self._need_passport_or_continue(s)
         return await self.on_enter(s)
 

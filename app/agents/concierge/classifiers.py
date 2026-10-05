@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from app.agents.concierge.slots import extract_slots
-from app.core.places import CITIES, CITY_ALIASES, COUNTRY_ALIASES
+from app.core.places import CITIES, CITY_ALIASES, COUNTRY_ALIASES, fuzzy_city
 
 SERVICES = ("flight", "hotel", "cab", "nearby", "planner", "events", "visa", "forex", "guide")
 INTENTS = SERVICES + ("bookings", "help", "buddy", "smalltalk", "unknown")
@@ -28,7 +28,7 @@ PATTERNS = {
     "events": r"\b(events?|concerts?|festivals?|matches|gigs?|shows?)\b",
     "nearby": r"\b(near ?by|near me|around me|aas ?paas|paas mein|nearest|closest|close by)\b",
     # newcomer talk, but only when it is about travel ("kuch samajh nahi aa raha" alone is a mood, not a trip)
-    "guide": r"(?=.*\b(trip|travel\w*|abroad|videsh|vacation|holiday|ghoom\w*|tour|visa|flights?|international|yatra|safar)\b).*\b(first time|pehli ?baar|kuch (?:nahi|nahin) pata|nahi pata|nahin pata|guide me|help me plan|where (?:do i|should i|to) start|kahan se shuru|kaise karu|kya kya (?:karna|chahiye)|confused|roadmap|checklist|step by step|never (?:travelled|traveled|been abroad)|new to (?:travel|travelling|traveling))\b",
+    "guide": r"(?=.*\b(trip|travel\w*|abroad|videsh|vacation|holiday|ghoom\w*|tour|visa|flights?|international|yatra|safar)\b).*\b(first time|pehli ?baar|kuch (?:nahi|nahin) pata|nahi pata|nahin pata|where (?:do i|should i|to) start|kahan se shuru|kaise karu|kya kya (?:karna|chahiye)|confused|roadmap|checklist|step by step|never (?:travelled|traveled|been abroad)|new to (?:travel|travelling|traveling))\b|\b(guide me|help me plan)\b",
     "bookings": r"\b(my bookings?|pnr|(?:show|view|see|check) my trips?|booking status|cancel (?:my )?(?:booking|ticket|flight))\b",
 }
 
@@ -47,8 +47,10 @@ class Intent:
 
 
 class KeywordClassifier:
-    def classify(self, text: str, today: date) -> Intent:
+    def classify(self, text: str, today: date, active: str | None = None) -> Intent:
         t = text.lower().strip()
+        match_t = f"{t} trip" if active in ("flight", "hotel", "cab", "visa", "forex", "planner", "guide") else t
+
         if t in ("help", "?", "what can you do", "what can you do?"):
             return Intent("help")
         if t in THANKS:
@@ -57,7 +59,7 @@ class KeywordClassifier:
             return Intent("smalltalk", reply="Safe travels! ✈️ Just say *hi* whenever you need me.")
 
         slots = extract_slots(t, today)
-        hits = [name for name, pat in PATTERNS.items() if re.search(pat, t)]
+        hits = [name for name, pat in PATTERNS.items() if re.search(pat, match_t)]
         if len(hits) > 1 and "nearby" in hits:  # "hotel near me" is a hotel request; "near me" only matters on its own
             hits.remove("nearby")
         if "bookings" in hits:
@@ -92,6 +94,8 @@ class LLMClassifier:
                 "currency": {"type": "string", "description": "For forex: the foreign currency they want, as a 3-letter ISO code (USD, AED...), if stated"},
                 "amount": {"type": "number", "description": "For forex: the amount they mentioned, if any"},
                 "amount_in_inr": {"type": "boolean", "description": "For forex: true if that amount is in rupees"},
+                "sort_by": {"type": "string", "enum": ["cheap", "fast", "time"], "description": "How to sort results if asked (e.g. 'cheapest'->'cheap', 'fastest'->'fast')"},
+                "max_budget": {"type": "number", "description": "Maximum budget in INR (flight ticket or hotel per night), if stated"},
                 "options": {**_service_list, "description": "If the request is vague, up to 3 services to offer, most useful first"},
                 "question": {"type": "string", "description": "If vague: one short clarifying question to ask with those options"},
                 "reply": {"type": "string", "description": "Only for smalltalk: one short friendly sentence"},
@@ -116,16 +120,15 @@ class LLMClassifier:
             "places near the user: cafés, food, ATMs, pharmacies, petrol, parks, malls, sights; put what they want in "
             "`place`), planner (itineraries, multi-day trip planning), events (concerts, shows, festivals, things to do "
             "near them), visa, forex (currency, travel cards), guide (a newcomer or an unsure traveller who wants the whole trip walked through step by step: what to do first, documents, deadlines, where to go). Flight, hotel, cab and visa are live; still route to the others. Other intents: bookings "
-            "(view/cancel an existing booking or PNR), help (what can you do), buddy (personal talk: feelings, worries, "
-            "problems, advice, general questions, anything that is not a travel request), smalltalk (greeting, thanks, "
+            "(view/cancel an existing booking or PNR), help (what can you do), buddy (conversational companion: advice, questions, travel information, recommendations, feelings, worries, ideas, anything conversational), smalltalk (greeting, thanks, "
             "chit-chat), unknown.\n"
             "Rules:\n"
+            "- A general question, inquiry, or advice request (e.g. 'tell me about Tokyo', 'what to do in Goa', 'is it safe', 'best time to visit', 'flight duration', 'recommendations', 'kya plan karein', 'guide me') is ALWAYS `buddy`. Only route to `flight`/`hotel`/`cab` when the user EXPLICITLY wants to search or book.\n"
             "- A problem or question about a trip that is ALREADY booked (running late, traffic, lost, directions, delays, "
             "what to carry, bored between flights) is `buddy`, not `flight`. Same for a question about a hotel they ALREADY booked "
             "(check-in time, amenities, cancellation, how to get there, other options nearby): `buddy`, not `hotel`. A message with 'near me' / 'nearby' for a "
             "place type is `nearby`; for shows or things to do it is `events`.\n"
-            "- A wish to travel somewhere ('jana hai New York', 'exploring USA', 'planning Japan') is a trip request, never "
-            "`buddy`: set to_city (a country counts) and intent `flight`.\n"
+            "- A wish to travel somewhere ('jana hai New York', 'exploring USA', 'planning Japan') with an explicit desire to fly is `flight`.\n"
             "- Several things in one message: put the most useful to do first in `intent` and the rest in `also`, in "
             "trip order (flight, visa, forex, hotel, cab, events).\n"
             "- Vague message (e.g. 'I want to go to Goa', 'planning a Dubai trip'): intent unknown, `options` = the "
@@ -137,7 +140,14 @@ class LLMClassifier:
             "to_city / from_city exactly as they wrote it.\n"
             f"- Today is {today.isoformat()} ({today:%A}). Resolve 'tomorrow', 'this Saturday', 'next week' to "
             "YYYY-MM-DD. Leave details empty if not given.\n"
-            "- reply/question: English, max 25 words, friendly. Never invent bookings, prices or availability."
+            "- reply/question: English, max 25 words, friendly. Never invent bookings, prices or availability.\n"
+            "\n"
+            "CRITICAL: CONVERSATION STATE & INTENT HANDLING\n"
+            "1. CURRENT MESSAGE HAS PRIORITY: You are not a state machine. A previous intent (like hotel or flight) MUST NOT remain active for every future message.\n"
+            "2. DO NOT FORCE MESSAGES INTO THE PREVIOUS WORKFLOW: If the message is 'hello', 'bhai sun', 'wait', 'thanks', etc., and has no new travel request, route as `buddy` or `smalltalk`, NOT the previous workflow.\n"
+            "3. FOLLOW-UP DETECTION: A message continues the previous workflow ONLY if it clearly refers to it (e.g., 'return 16 ko' or 'cheapest wala dikha'). If they say 'waise Puri mein hotel kaisa hai?', it's a new hotel intent.\n"
+            "4. NEW DESTINATION REPLACES OLD: If they provide a new origin/destination/date, update it. NEVER reuse an old destination when they give a new one. Latest explicit user message wins.\n"
+            "5. NATURAL CONVERSATION: Behave like a natural assistant, not a booking form. If they change topic or chat casually, follow it naturally (`buddy`)."
         )
 
     async def _call(self, system: str, prompt: str) -> dict:
@@ -162,7 +172,7 @@ class LLMClassifier:
         slots = {}
         for key, field_name in (("from", "from_city"), ("to", "to_city")):
             name = (data.get(field_name) or "").strip()
-            if code := CITY_ALIASES.get(name.lower()):
+            if code := CITY_ALIASES.get(name.lower()) or fuzzy_city(name):  # (fuzzy: "ahemdabad" is Ahmedabad)
                 slots[key] = code
             elif key == "to" and re.fullmatch(r"[^\W\d_][\w .'\-]{1,39}", name):
                 slots["unknown_to"] = name  # a real-looking place we have no airport for: the Concierge says so honestly
@@ -184,6 +194,10 @@ class LLMClassifier:
                 slots["amount"] = float(data["amount"])
                 if data.get("amount_in_inr") is True:
                     slots["amount_inr"] = True
+        if data.get("sort_by") in ("cheap", "fast", "time"):
+            slots["sort_by"] = data["sort_by"]
+        if isinstance(data.get("max_budget"), (int, float)) and data["max_budget"] > 0:
+            slots["max_budget"] = float(data["max_budget"])
         name = data.get("intent") if data.get("intent") in INTENTS else "unknown"
         services = lambda key: [x for x in dict.fromkeys(data.get(key) or []) if x in SERVICES and x != name]
         return Intent(name, slots, reply=(data.get("reply") or "").strip()[:300], also=services("also"),

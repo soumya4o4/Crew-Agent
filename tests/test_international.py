@@ -11,7 +11,7 @@ from app.agents.flight.formatting import suggest_steps
 from app.core import places
 from app.core.utils import now_ist
 from app.services.travel_advisor import TravelAdvisor, VisaAdvice, parse_visa_advice
-from fakes import Chat, FakeRepo
+from fakes import DETAILS, Chat, FakeRepo
 
 
 class FakeAdvisor:
@@ -60,7 +60,7 @@ def test_an_international_flight_never_brings_up_the_visa_unasked():
     card = open_dubai_flight(c, fid)
     assert "visa" not in card["body"].lower() and "passport" not in card["body"].lower()
     assert "svc:visa" not in c.ids() and advisor.calls == []
-    c.send(reply_id="act:book")
+    c.send(reply_id="act:book"); c.send(DETAILS)
     c.send(reply_id="cfm:yes")
     assert "visa" not in c.last[1]["body"].lower() and "svc:visa" not in c.ids()
     assert c.ids()[0] == "svc:hotel"                                      # hotel first, then the airport cab and forex

@@ -66,6 +66,8 @@ class Agent:
         """While expects_text() is true: should this typed message still go to this agent, given what the keyword
         classifier made of it (`other`, an Intent) and the names of all agents (`known`)? False hands it to the
         Concierge, which then acts on `other` (a topic switch). Default: stay, unless another service was named."""
+        if other.name == "bookings":
+            return False
         return other.name not in known or self.name in (other.name, *other.also)
 
     async def on_enter(self, s: Session) -> list[dict]:

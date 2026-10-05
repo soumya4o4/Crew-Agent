@@ -35,6 +35,9 @@ class FakeHotelRepo:
     def list_hotel_cities(self):
         return self.cities
 
+    def list_airport_cities(self):  # with Hotelbeds: any city we know, not only where hotels are stored
+        return self.cities + [{"code": "DEL", "city": "Delhi", "country": "India"}]
+
     def _taken(self, room_id, check_in, check_out):
         return sum(1 for b in self.bookings.values() if b["room_id"] == room_id and b["status"] != "cancelled"
                    and b["check_in"] < check_out.isoformat() and b["check_out"] > check_in.isoformat())
@@ -50,6 +53,29 @@ class FakeHotelRepo:
             if free:
                 out.append({**h, "rooms": free})
         return out
+
+    def sync_live_hotels(self, city_code, live):
+        """Like HotelRepo: mirror live hotels by (city, name) and (hotel, room type); returns the ids found."""
+        ids = set()
+        for h in live:
+            row = next((x for x in self.hotels.values() if x["city_code"] == city_code and x["name"] == h["name"]), None)
+            if not row:
+                hid = str(uuid.uuid4())
+                row = self.hotels[hid] = {"id": hid, "city_code": city_code, "name": h["name"], "amenities": [], "description": ""}
+            row.update(area=h["area"] or city_code, stars=h["stars"], rating=h["rating"], hb_code=h["hb_code"],
+                       **{k: h[k] for k in ("image_url", "amenities", "description") if h.get(k)})
+            ids.add(row["id"])
+            for r in h["rooms"]:
+                room = next((x for x in self.rooms.values() if x["hotel_id"] == row["id"] and x["room_type"] == r["room_type"]), None)
+                if not room:
+                    rid = str(uuid.uuid4())
+                    room = self.rooms[rid] = {"id": rid, "hotel_id": row["id"], "room_type": r["room_type"]}
+                room.update(bed=r["bed"], max_guests=r["max_guests"], price_inr=r["price_inr"], rooms_total=r["left"],
+                            hb_rate_key=r["rate_key"])
+        return ids
+
+    def set_supplier_ref(self, booking_id, reference):
+        self.bookings[booking_id]["hb_reference"] = reference
 
     def get_hotel(self, hotel_id):
         return self.hotels.get(hotel_id)

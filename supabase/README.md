@@ -2,7 +2,7 @@
 
 ## What's here
 - `migrations/20261001000000_travel_concierge_schema.sql`: tables (`airports`, `flights`, `users`, `bookings`, `conversations`), indexes, and RLS.
-- `seed/seed_dummy_data.py`: generates and inserts dummy data.
+- `seed/seed_dummy_data.py`: inserts the reference data (airports, cabs, events, visa rules) and a few dummy users. **Flights are not seeded:** they come live from Duffel (run `migrations/20261016000000_duffel_flights.sql`).
 
 ## 1. Run the migration
 Pick one:
@@ -26,19 +26,15 @@ pip install -r supabase/seed/requirements.txt
 python supabase/seed/seed_dummy_data.py
 ```
 
-Re-running is safe. The script first deletes the dummy users (phones `+91500000000X`), their bookings and conversations, and **all** rows in `flights`. It then regenerates everything from today, so dates always cover the next 30 days.
+Re-running is safe. The script first deletes the dummy users (phones `+91500000000X`), their bookings and conversations, then inserts everything again.
 
 ## What gets generated
 | Table | Rows | Notes |
 |---|---|---|
-| airports | 11 | 10 Indian airports + DXB |
-| flights | about 4,400 | 15 routes in both directions (BOM↔DXB is the only international one), 4-6 flights per day per route, 30 days |
+| airports | 19 | 10 Indian airports + 9 world cities (any airport you add here can be searched) |
 | users | 10 | Indian names, phones `+915000000001`–`+915000000010` |
-| bookings | 15 | 8 confirmed, 3 pending, 4 cancelled; one confirmed booking is on a delayed flight |
 | conversations | 3 | sample mid-flow bot states |
 
-- **Fares:** domestic Economy is ₹3,000–9,000 and Dubai is ₹12,000–25,000. Fares vary by time of day (morning and evening cost more, night costs less) and by airline. They rise up to 30% for departures within 10 days and 5% on Fri/Sun. Air India Business fares are 2.2× Economy, so they sit above those ranges.
-- **Edge cases:** about 3% sold out (`seats_left = 0`), 3% `delayed`, 2% `cancelled`, and about 7% of flights are 1-stop (longer duration, slightly cheaper).
 - **Fake phones:** `+91 5…` is not an allocated Indian mobile range, so none of these numbers can reach a real person. If you want to test the bot over WhatsApp, edit `DUMMY_PHONES` in the script to use your own test number.
 
 ## Cabs, travellers and chat memory
@@ -47,13 +43,17 @@ Run `migrations/20261003000000_cabs_and_passengers.sql` (safe to re-run). It add
 - `bookings.passengers` for multi-traveller flight bookings
 - the `messages` table (chat history)
 
-Seed only the cab data, leaving flights and real bookings untouched:
+Seed only the cab data, leaving real bookings untouched:
 ```
 python supabase/seed/seed_dummy_data.py --cabs-only
 ```
 This creates 60 pickup/drop places (10 cities), 40 rate cards, 120 fake drivers and 6 sample rides. Driver names, phones (`+91 5…`) and plates are invented.
 
-The full seed (no flag) also resets flights. It stops with an error if a real booking still references a flight, so real bookings are never deleted by accident.
+## Live flights (Duffel)
+Run `migrations/20261016000000_duffel_flights.sql` (safe to re-run). It turns `flights` into a mirror of the offers Duffel returned (offer id,
+expiry, price in the airline's currency, itinerary key), adds the airline ticket to `bookings` (`duffel_order_id`, `airline_pnr`,
+`passenger_details`, `contact`), removes the old hand-made flights that no booking uses, and creates `prune_flights()`.
+Set `DUFFEL_API_TOKEN` in `.env`.
 
 ## Payments
 Run `migrations/20261004000000_payments.sql`: one `payments` row per Razorpay payment link, tied to a (pending) booking.

@@ -1,7 +1,7 @@
 import asyncio
 from datetime import timedelta
 
-from fakes import CONTACT, Chat, FakeGateway, WA
+from fakes import CONTACT, DETAILS, Chat, FakeGateway, WA
 from app.agents.hotel.formatting import cancel_policy
 from app.core.utils import now_ist
 
@@ -137,7 +137,7 @@ def test_booking_without_razorpay_confirms_instantly():
     summary = pick(c)
     assert "Last check" in summary["body"] and "₹4,500 × 2 = *₹9,000*" in summary["body"]
     out = c.send(reply_id="hcfm:yes")
-    assert "Stay Confirmed" in out["body"] and "HB00001" in out["body"]
+    assert "Payment received" in out["body"] and "Internal Booking Ref" in out["body"]
     b = only_booking(c)
     assert b["status"] == "confirmed" and b["total_price_inr"] == 9000 and b["guests"] == 2
     assert [i for i, _ in c.last[1]["buttons"]] == ["hotel:stays", "svc:cab", "nav:menu"]
@@ -149,7 +149,7 @@ def test_confirm_holds_the_room_and_sends_a_payment_link():
     out = book(c)
     assert [m["type"] for m in c.last] == ["cta", "buttons"]
     assert out["url"] == "https://rzp.io/i/plink_1" and out["button_text"] == "Pay ₹9,000"
-    assert "Test mode" in out["body"] and "Held for 20 minutes" in out["body"]
+    assert "Test mode" in out["body"]
     assert [i for i, _ in c.last[1]["buttons"]] == ["chk:check", "chk:cancel"]
     b = only_booking(c)
     assert b["status"] == "pending" and gw.links["plink_1"]["amount"] == 9000 and gw.links["plink_1"]["ref"] == b["ref"]
@@ -164,7 +164,7 @@ def test_ive_paid_confirms_once_razorpay_says_paid():
     book(c)
     assert "haven't received the payment" in c.send(reply_id="chk:check")["body"]
     gw.paid.add("plink_1")
-    assert "Stay Confirmed" in c.send(reply_id="chk:check")["body"] and only_booking(c)["status"] == "confirmed"
+    assert "Payment received" in c.send(reply_id="chk:check")["body"] and only_booking(c)["status"] == "confirmed"
     assert c.send(reply_id="chk:check") is not None  # a stale tap after confirming is harmless
 
 
@@ -172,7 +172,7 @@ def test_webhook_confirms_and_is_idempotent():
     c = Chat(gateway=FakeGateway())
     book(c)
     number, messages = asyncio.run(c.concierge.confirm_payment("plink_1"))  # the Concierge finds the right agent
-    assert number == WA and "Stay Confirmed" in messages[0]["body"] and only_booking(c)["status"] == "confirmed"
+    assert number == WA and "Payment received" in messages[0]["body"] and only_booking(c)["status"] == "confirmed"
     assert all(m["type"] != "reaction" for m in messages)  # nothing to react to: the user didn't tap
     assert asyncio.run(c.concierge.confirm_payment("plink_1")) is None  # Razorpay retried: no second voucher
     assert "no payment waiting" in c.send(reply_id="chk:check")["body"]
@@ -254,7 +254,7 @@ def test_one_broken_sweeper_does_not_hide_the_others_notices(monkeypatch):
     pay_flow_chat.enter_flights()
     pay_flow_chat.send("flight from indore to mumbai tomorrow")
     pay_flow_chat.send(reply_id=next(i for i in pay_flow_chat.ids() if i.startswith("flt:")))
-    pay_flow_chat.send("book"); pay_flow_chat.send("yes"); pay_flow_chat.send(CONTACT)
+    pay_flow_chat.send("book"); pay_flow_chat.send(DETAILS); pay_flow_chat.send("yes"); pay_flow_chat.send(CONTACT)
     c.repo.payments["plink_1"]["expires_at"] = now_ist() - timedelta(minutes=1)
 
     def broken(now):
@@ -285,7 +285,7 @@ def test_a_hotels_own_image_url_beats_the_stock_photo_and_the_same_hotel_always_
 
 def test_the_confirmed_stay_voucher_carries_the_photo():
     out = book(Chat(gateway=Off()))
-    assert out["type"] == "image" and "Stay Confirmed" in out["body"] and "HB00001" in out["body"]
+    assert out["type"] == "image" and "Payment received" in out["body"] and "Internal Booking Ref" in out["body"]
 
 
 def test_my_stays_detail_shows_the_photo_as_a_header():
@@ -448,3 +448,65 @@ def test_amenity_questions_do_not_break_the_booking_flow():
     c.send("pool hai?")
     c.send(reply_id=f"hroom:{c.hotel_repo.room_of('Calangute Shores', 'Deluxe')['id']}")  # the room list still works
     assert c.send(reply_id="hname:self")["type"] == "buttons"
+
+
+def ctx_of(c):
+    return next(iter(c.repo.convos.values()))["context"]
+
+
+def test_reset_forgets_everything_mid_search():
+    c = Chat(gateway=Off())
+    c.send("hi"); c.send(reply_id="svc:hotel"); c.send(reply_id="hotel:find"); c.send(reply_id="hcity:GOI")
+    assert "hotel" in ctx_of(c)
+    c.send("reset")
+    assert "reset" in c.last[0]["body"].lower()
+    assert next(iter(c.repo.convos.values()))["current_step"] == "menu" and not ctx_of(c).get("hotel") and "agent" not in ctx_of(c)
+
+
+def test_reset_releases_a_payment_still_waiting():
+    gw = FakeGateway()
+    c = Chat(gateway=gw)
+    book(c)
+    c.send("Reset!")
+    assert only_booking(c)["status"] == "cancelled" and gw.cancelled == {"plink_1"}
+    assert "checkout" not in ctx_of(c)
+
+
+def test_reset_never_cancels_a_stay_that_is_paid():
+    gw = FakeGateway()
+    c = Chat(gateway=gw)
+    book(c)
+    gw.paid.add("plink_1")  # paid on Razorpay, the webhook has not reached us yet
+    c.send("reset")
+    assert only_booking(c)["status"] == "pending" and gw.cancelled == set() and "checkout" not in ctx_of(c)
+    asyncio.run(c.concierge.confirm_payment("plink_1"))  # the webhook arrives: the stay is confirmed
+    assert only_booking(c)["status"] == "confirmed"
+    c.send("reset")
+    assert only_booking(c)["status"] == "confirmed"
+
+
+def test_hotel_request_for_a_city_we_cannot_search_says_so_not_a_flight_message():
+    from app.agents.base import Session
+    from app.agents.concierge.classifiers import Intent
+    c = Chat(gateway=Off())
+    c.send("hi")
+    s = Session(f"+{WA}", {"id": "u"}, "menu", "m1", {})
+    out = asyncio.run(c.concierge._apply(s, Intent("hotel", {"unknown_to": "manali"}, ), "hotel in manali"))
+    assert "can't find stays in Manali" in out[0]["body"] and "flights" not in out[0]["body"] and "Which city" in out[1]["body"]
+
+
+def test_misspelt_city_is_understood():
+    from app.core.places import fuzzy_city
+    assert fuzzy_city("ahemdabad") == "AMD" and fuzzy_city("bangalor") == "BLR" and fuzzy_city("xyz") is None
+    c = Chat(gateway=Off())
+    c.send("hi"); c.send(reply_id="svc:hotel"); c.send(reply_id="hotel:find")
+    out = c.send("ahemdabad")  # asked for the city: the typo is accepted
+    assert "Ahmedabad" in out["body"]
+
+
+def test_next_weekend_on_a_saturday_is_a_week_away():
+    from datetime import date
+    from app.agents.concierge.slots import extract_date
+    sat, sun, wed = date(2026, 10, 3), date(2026, 10, 4), date(2026, 10, 7)
+    assert extract_date("this weekend", sat) == "2026-10-03" and extract_date("next weekend", sat) == "2026-10-10"
+    assert extract_date("next weekend", sun) == "2026-10-10" and extract_date("weekend", wed) == "2026-10-10"

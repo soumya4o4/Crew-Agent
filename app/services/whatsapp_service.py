@@ -87,8 +87,8 @@ class WhatsAppService:
             reply_id, text = reply.get("id"), reply.get("title", "")
             if not reply_id:
                 return None
-        elif message.type in ("image", "document", "video") and (message.image or message.document or message.video):
-            m = message.image or message.document or message.video
+        elif message.type in ("image", "document", "video", "audio") and (message.image or message.document or message.video or message.audio):
+            m = message.image or message.document or message.video or message.audio
             media = {"id": m["id"], "mime": m.get("mime_type", ""), "filename": m.get("filename", ""), "kind": message.type}
             text = m.get("caption", "") or ""
         elif message.type == "location" and message.location:

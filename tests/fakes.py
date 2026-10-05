@@ -22,7 +22,8 @@ from fakes_geo import FakeEventsRepo, FakeGeo
 from fakes_hotel import FakeHotelRepo
 from fakes_planner import FakeMedia, FakePlannerBrain
 from fakes_visa import FakeVerifier, FakeVisaRepo, fake_fetch_media
-from app.core.utils import now_ist
+from app.core.utils import IST, now_ist
+from app.services.duffel import DuffelError
 
 WA = "919876543210"
 
@@ -35,16 +36,17 @@ class FakeRepo:
             {"code": "DXB", "city": "Dubai", "name": "Dubai Airport", "country": "UAE"},
         ]
         tomorrow = (now_ist() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        self.flights = {}
-        for i, (price, seats, status) in enumerate([(4000, 3, "scheduled"), (3500, 1, "delayed"), (3000, 0, "scheduled")]):
-            fid = str(uuid.uuid4())
+        self.inventory = []  # what the airlines (FakeLive) offer; `flights` is only what searches have mirrored into our table
+        for i, (price, refundable) in enumerate([(4000, True), (3500, False), (3000, False)]):
             dep = tomorrow + timedelta(hours=i * 3)
-            self.flights[fid] = {
-                "id": fid, "airline": "IndiGo", "flight_no": f"6E-{1000 + i}", "from_code": "IDR", "to_code": "BOM",
+            self.inventory.append({
+                "airline": "IndiGo", "flight_no": f"6E-{1000 + i}", "from_code": "IDR", "to_code": "BOM",
                 "departure_time": dep.isoformat(), "arrival_time": (dep + timedelta(minutes=90)).isoformat(),
-                "duration_min": 90, "price_inr": price, "class": "Economy", "seats_left": seats,
-                "baggage_kg": 15, "stops": 0, "refundable": i == 0, "status": status,
-            }
+                "duration_min": 90, "price_inr": price, "class": "Economy", "checked_bags": 1, "baggage_kg": 0, "stops": 0,
+                "refundable": refundable, "status": "scheduled", "duffel_offer_id": f"off_{i}", "offer_pax": 1, "offer_total": price / 80,
+                "offer_currency": "USD", "offer_passenger_ids": ["pas_0"], "itinerary_key": f"6E-{1000 + i}@{dep:%Y-%m-%dT%H:%M:%S}",
+            })
+        self.flights = {}
         self.users, self.convos, self.bookings, self.messages, self.payments = {}, {}, {}, [], {}
         self._init_cabs()
 
@@ -72,43 +74,42 @@ class FakeRepo:
     def list_airports(self):
         return self.airports
 
-    def origins_for(self, to_code):
-        return sorted({f["from_code"] for f in self.flights.values() if f["to_code"] == to_code and f["seats_left"] > 0})
-
-    def destinations_from(self, from_code):
-        return sorted({f["to_code"] for f in self.flights.values() if f["from_code"] == from_code and f["seats_left"] > 0})
+    def sync_live_flights(self, live):
+        rows = []
+        for f in live:
+            row = next((r for r in self.flights.values() if r.get("duffel_offer_id") == f["duffel_offer_id"]), None)
+            if row is None:
+                row = {"id": str(uuid.uuid4())}
+                self.flights[row["id"]] = row
+            row.update(f)
+            rows.append(dict(row))
+        return rows
 
     def popular_routes(self, limit=6):
         counts = {}
-        for f in self.flights.values():
-            counts[(f["from_code"], f["to_code"])] = counts.get((f["from_code"], f["to_code"]), 0) + 1
+        for b in self.bookings.values():
+            if b["status"] != "cancelled":
+                key = (b["flights"]["from_code"], b["flights"]["to_code"])
+                counts[key] = counts.get(key, 0) + 1
         return sorted(counts, key=counts.get, reverse=True)[:limit]
-
-    @staticmethod
-    def _in_window(x, start, end):
-        return start <= datetime.fromisoformat(x["departure_time"]) < end
-
-    def search_flights(self, f, t, start, end):
-        return [x for x in self.flights.values() if x["from_code"] == f and x["to_code"] == t
-                and x["status"] != "cancelled" and x["seats_left"] > 0 and self._in_window(x, start, end)]
-
-    def search_from(self, f, start, end):
-        return [x for x in self.flights.values() if x["from_code"] == f
-                and x["status"] != "cancelled" and x["seats_left"] > 0 and self._in_window(x, start, end)]
 
     def get_flight(self, fid):
         return self.flights.get(fid)
 
-    def create_booking(self, user_id, flight, name, passengers=1, status="confirmed"):
-        f = self.flights[flight["id"]]
-        if f["seats_left"] < passengers:
-            return None
-        f["seats_left"] -= passengers
-        b = {"id": str(uuid.uuid4()), "pnr": "ABC123", "user_id": user_id, "flight_id": f["id"],
-             "passenger_name": name, "status": status, "total_price_inr": f["price_inr"] * passengers,
-             "passengers": passengers, "flights": f}
+    def create_booking(self, user_id, flight, name, passengers=1, status="confirmed", details=None, contact=None):
+        b = {"id": str(uuid.uuid4()), "pnr": "ABC123", "user_id": user_id, "flight_id": flight["id"],
+             "passenger_name": name, "status": status, "total_price_inr": flight["price_inr"] * passengers,
+             "passengers": passengers, "flights": self.flights[flight["id"]], "passenger_details": details or [],
+             "contact": contact or {}, "duffel_order_id": None, "airline_pnr": None}
         self.bookings[b["id"]] = b
         return b
+
+    def set_ticket(self, booking_id, order_id, airline_pnr):
+        self.bookings[booking_id].update(duffel_order_id=order_id, airline_pnr=airline_pnr or None)
+
+    def save_traveller(self, user_id, name, dob, gender):
+        user = next(u for u in self.users.values() if u["id"] == user_id)
+        user["preferences"].setdefault("travellers", {})[name.lower()] = {"dob": dob, "gender": gender}
 
     def list_user_bookings(self, user_id, limit=9):
         return [b for b in self.bookings.values() if b["user_id"] == user_id]
@@ -120,9 +121,9 @@ class FakeRepo:
     def cancel_booking(self, b):
         stored = self.bookings[b["id"]]  # callers may hold a copy, like a real DB read
         if stored["status"] == "cancelled":
-            return
+            return False
         stored["status"] = "cancelled"
-        self.flights[stored["flight_id"]]["seats_left"] += stored.get("passengers", 1)
+        return True
 
     # --- payments
     def create_payment(self, booking_id, user_id, amount, link_id, short_url, expires_at):
@@ -146,6 +147,10 @@ class FakeRepo:
             return None
         b["status"] = "confirmed"
         return self.get_booking_with_user(b["id"])
+
+    def get_payment_for_booking(self, booking_id):
+        found = [p for p in self.payments.values() if p["booking_id"] == booking_id]
+        return found[-1] if found else None
 
     def cancel_payment(self, booking_id):
         for p in self.payments.values():
@@ -212,6 +217,57 @@ class FakeRepo:
         self.cab_rides[rid].update(status="cancelled", cancel_fee_inr=fee)
 
 
+class FakeLive:
+    """Stands in for Duffel: offers the flights in `repo.inventory`, issues tickets, and the test decides what goes wrong."""
+
+    def __init__(self, repo):
+        self.repo = repo
+        self.searches, self.orders, self.cancelled = [], {}, []
+        self.fail_search = self.fail_book = self.gone = self.cant_cancel = False
+        self.price_bump = 0  # added to every fare when it is asked for again
+        self.refund_ratio = 1.0
+
+    async def search(self, origin, destination, day, pax=1, fresh=False):
+        if self.fail_search:
+            raise DuffelError("search failed")
+        self.searches.append((origin, destination, day, pax))
+        found = [f for f in self.repo.inventory if f["from_code"] == origin and f["to_code"] == destination
+                 and datetime.fromisoformat(f["departure_time"]).astimezone(IST).date() == day]
+        return [self._for(f, pax) for f in found]
+
+    @staticmethod
+    def _for(f, pax):
+        return {**f, "offer_pax": pax, "offer_passenger_ids": [f"pas_{i}" for i in range(pax)], "offer_total": f["offer_total"] * pax}
+
+    async def refresh(self, flight, pax):
+        if self.gone:
+            return None
+        base = next((f for f in self.repo.inventory if f["itinerary_key"] == flight["itinerary_key"]), None)
+        if base is None:
+            return None
+        fresh = self._for(base, pax)
+        fresh["price_inr"] += self.price_bump
+        fresh["duffel_offer_id"] += f"-fresh{pax}"
+        return fresh
+
+    async def book(self, flight, travellers, contact, reference):
+        if self.fail_book:
+            raise DuffelError("airline said no", "order_failed")
+        order = f"ord_{len(self.orders) + 1}"
+        self.orders[order] = {"flight": flight, "travellers": travellers, "contact": contact, "reference": reference}
+        return {"order_id": order, "booking_reference": "ZX9Q2K"}
+
+    async def cancel_quote(self, order_id):
+        if self.cant_cancel:
+            raise DuffelError("not cancellable")
+        total = self.orders[order_id]["flight"]["offer_total"]
+        return {"quote_id": f"cq_{order_id}", "refund_amount": total * self.refund_ratio, "currency": "USD"}
+
+    async def cancel(self, quote_id):
+        self.cancelled.append(quote_id)
+
+
+DETAILS = "14/03/1992 M"  # what a traveller sends when asked for their date of birth and gender
 CONTACT = "Aarav Sharma, aarav@example.com, 9876543210"  # what a traveller sends when asked for name, email and phone
 
 
@@ -221,6 +277,7 @@ class FakeGateway:
 
     def __init__(self):
         self.links, self.paid, self.cancelled, self.fail = {}, set(), set(), False
+        self.refunds, self.refund_fails = [], False
 
     async def create_link(self, amount_inr, reference_id, description, phone, name, expire_minutes, email=""):
         if self.fail:
@@ -236,10 +293,16 @@ class FakeGateway:
     async def cancel_link(self, link_id):
         self.cancelled.add(link_id)
 
+    async def refund(self, link_id, amount_inr):
+        if self.refund_fails:
+            raise RuntimeError("razorpay down")
+        self.refunds.append((link_id, amount_inr))
+        return True
+
 
 def build_concierge(repo, router=None, gateway=None, visa_agent=None, hotel_agent=None, buddy_agent=None, geo=None, events_repo=None,
-                    planner_agent=None, advisor=None, forex_agent=None, guide_agent=None):
-    agents = [guide_agent, FlightAgent(repo, gateway, advisor), hotel_agent or HotelAgent(FakeHotelRepo(repo), gateway), CabAgent(repo),
+                    planner_agent=None, advisor=None, forex_agent=None, guide_agent=None, live=None):
+    agents = [guide_agent, FlightAgent(repo, gateway, advisor, live), hotel_agent or HotelAgent(FakeHotelRepo(repo), gateway), CabAgent(repo),
               NearbyAgent(geo or FakeGeo()), planner_agent or TripPlannerAgent(repo), EventsAgent(events_repo or FakeEventsRepo()),
               visa_agent or VisaAgent(FakeVisaRepo(repo), gateway, None, fake_fetch_media), forex_agent or ForexAgent(FakeForexRepo(repo), gateway, FakeRates())]
     if buddy_agent:  # like the real app, Buddy only exists when there is an LLM for it
@@ -252,6 +315,7 @@ class Chat:
 
     def __init__(self, repo=None, router=None, gateway=None, brain=None, planner=False, advisor=None, rates=None, guide_advisor=None):
         self.repo = repo or FakeRepo()
+        self.live = FakeLive(self.repo)
         self.visa_repo, self.verifier = FakeVisaRepo(self.repo), FakeVerifier()
         visa = VisaAgent(self.visa_repo, gateway, self.verifier, fake_fetch_media)
         self.hotel_repo = FakeHotelRepo(self.repo)
@@ -266,7 +330,7 @@ class Chat:
         planner_agent = (PlannerAgent(self.repo, self.planner_brain, self.media, self.media.download, self.media.send, self.media.video_parts,
                                       background=False) if planner else None)
         self.concierge, self.n, self.last = build_concierge(self.repo, router, gateway, visa, hotel, buddy, self.geo, self.events_repo,
-                                                            planner_agent, advisor, forex, guide), 0, []
+                                                            planner_agent, advisor, forex, guide, self.live), 0, []
 
     def send(self, text="", reply_id=None):
         self.n += 1
@@ -299,15 +363,14 @@ class Chat:
         self.send("hi")
         return self.send(reply_id="svc:flight")
 
-    def pick_flight(self, name_reply="name:self"):
-        """From the flights menu: IDR -> BOM tomorrow, cheapest-first, first flight, book for self."""
-        self.send(reply_id="menu:book"); self.send(reply_id="from:IDR"); self.send(reply_id="to:BOM")
-        self.send(reply_id=self.ids()[1]); self.send(reply_id="sort:time")
+    def pick_flight(self, details=DETAILS):
+        """From the flights menu: IDR -> BOM tomorrow, by time, first flight, book for the user. Ends at the summary."""
+        self.send(reply_id="menu:book"); self.send("indore to mumbai tomorrow"); self.send(reply_id="sort:time")
         self.send(reply_id=next(i for i in self.ids() if i.startswith("flt:")))
         self.book()
-        return self.send(reply_id=name_reply)
+        return self.send(details) if details else self.last[0]
 
     def book(self, travellers=1):
-        """Tap Book Now; with more than one traveller, say how many (one traveller goes straight to the summary)."""
+        """Tap Book Now; with more than one traveller, say how many."""
         out = self.send(reply_id="act:book")
         return self.send(reply_id=f"pax:{travellers}") if travellers > 1 else out

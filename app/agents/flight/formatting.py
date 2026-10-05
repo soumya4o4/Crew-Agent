@@ -9,6 +9,19 @@ def stops_label(n: int) -> str:
     return "Non-stop" if n == 0 else f"{n} stop"
 
 
+def baggage_label(f: dict) -> str:
+    """"1 checked bag", "Cabin bag only", or (for flights we stored with a weight) "15 kg"."""
+    bags = f.get("checked_bags") or 0
+    if bags:
+        return f"{bags} checked bag{'s' if bags > 1 else ''}"
+    return f"{f['baggage_kg']} kg" if f.get("baggage_kg") else "Cabin bag only"
+
+
+def pnr_of(booking: dict) -> str:
+    """The reference to show: the airline's once the ticket is issued, else ours."""
+    return booking.get("airline_pnr") or booking["pnr"]
+
+
 def countdown(dep: datetime) -> str:
     days = (dep.date() - now_ist().date()).days
     if days <= 0:
@@ -25,7 +38,7 @@ def flight_card(f: dict) -> str:
         f"*{city(f['from_code'])}* ({f['from_code']}) ➜ *{city(f['to_code'])}* ({f['to_code']})",
         f"🛫 {dep:%a, %d %b} · *{dep:%H:%M}*",
         f"🛬 *{arr:%H:%M}* · ⏱ {dur(f['duration_min'])} · {stops_label(f['stops'])}",
-        f"🧳 {f['baggage_kg']} kg · {f['class']} · " + ("↩️ Refundable" if f["refundable"] else "🚫 Non-refundable"),
+        f"🧳 {baggage_label(f)} · {f['class']} · " + ("↩️ Refundable" if f["refundable"] else "🚫 Non-refundable"),
     ]
     if f["status"] == "delayed":
         lines.append("⚠️ This flight is running late")
@@ -55,8 +68,6 @@ def flight_tags(flights: list[dict]) -> dict[str, list[str]]:
             tags[f["id"]].append("🌅 Early bird")
         elif hour >= 22:
             tags[f["id"]].append("🌙 Late night")
-        if f["seats_left"] <= 3:
-            tags[f["id"]].append("🔥 Few seats")
     return tags
 
 

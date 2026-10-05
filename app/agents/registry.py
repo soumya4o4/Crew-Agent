@@ -17,8 +17,10 @@ from app.agents.visa import VisaAgent, VisaRepo
 from app.agents.visa.verifier import BasicVerifier, OpenAIVerifier
 from app.core import places
 from app.core.config import settings
+from app.services.duffel import DuffelClient
 from app.services.geo_service import GeoService
 from app.services.forex_rates import RateService
+from app.services.hotelbeds import HotelbedsClient
 from app.services.razorpay_service import RazorpayGateway
 from app.services.travel_advisor import TravelAdvisor
 
@@ -38,18 +40,19 @@ def build_concierge(supabase_client) -> Concierge:
     geo = GeoService()
     verifier = OpenAIVerifier.create(settings.OPENAI_API_KEY, settings.OPENAI_MODEL) if settings.OPENAI_API_KEY else BasicVerifier()
 
+    rates = RateService()
     hotel_repo, forex_repo, cab_repo = HotelRepo(supabase_client), ForexRepo(supabase_client), CabRepo(supabase_client)
     agents = [
         GuideAgent(GuideRepo(repo, hotel_repo, forex_repo, visa_repo, cab_repo), advisor),
-        FlightAgent(repo, gateway, advisor),
-        HotelAgent(hotel_repo, gateway, advisor),
+        FlightAgent(repo, gateway, advisor, DuffelClient(rates) if DuffelClient.configured() else None),
+        HotelAgent(hotel_repo, gateway, advisor, HotelbedsClient(rates) if HotelbedsClient.configured() else None),
         CabAgent(cab_repo),
         NearbyAgent(geo),
         (PlannerAgent(repo, OpenAIPlanner.create(settings.OPENAI_API_KEY, settings.OPENAI_MODEL, settings.OPENAI_TRANSCRIBE_MODEL))
          if settings.OPENAI_API_KEY else TripPlannerAgent(repo)),
         EventsAgent(EventsRepo(supabase_client)),
         VisaAgent(visa_repo, gateway, verifier),
-        ForexAgent(forex_repo, gateway, RateService(), advisor),
+        ForexAgent(forex_repo, gateway, rates, advisor),
     ]
 
     if settings.OPENAI_API_KEY:  # Buddy needs an LLM: without a key it simply isn't offered

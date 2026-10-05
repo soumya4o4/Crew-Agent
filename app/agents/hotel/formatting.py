@@ -31,8 +31,20 @@ def cancel_policy(check_in: date | str) -> str:
     return "🚫 Free cancellation has ended for these dates"
 
 
+def rating_text(h: dict) -> str:
+    """"⭐ 4.3 · " or nothing (live hotels may have no guest rating)."""
+    return f"⭐ {h['rating']} · " if h.get("rating") else ""
+
+
+def where(h: dict) -> str:
+    """"Calangute, Goa", or just "Pune" when the area is the city itself (Hotelbeds often says "Pune, Pune")."""
+    place = city(h["city_code"])
+    return place if not h.get("area") or h["area"].lower() == place.lower() else f"{h['area']}, {place}"
+
+
 def hotel_card(h: dict) -> str:
-    lines = [f"🏨 *{h['name']}* · {h['stars']}★", f"📍 {h['area']}, {city(h['city_code'])} · ⭐ {h['rating']}"]
+    rated = f" · ⭐ {h['rating']}" if h.get("rating") else ""
+    lines = [f"🏨 *{h['name']}* · {h['stars']}★", f"📍 {where(h)}{rated}"]
     if h.get("amenities"):
         lines.append("✨ " + " · ".join(h["amenities"][:5]))
     if h.get("description"):
@@ -70,7 +82,7 @@ def hotel_tags(hotels: list[dict]) -> dict[str, list[str]]:
     tags: dict[str, list[str]] = {h["id"]: [] for h in hotels}
     if len(hotels) > 1:
         tags[min(hotels, key=lambda h: h["rooms"][0]["price_inr"])["id"]].append("💸 Cheapest")
-        tags[max(hotels, key=lambda h: (h["rating"], h["stars"]))["id"]].append("🏆 Top rated")
+        tags[max(hotels, key=lambda h: (h.get("rating") or 0, h["stars"]))["id"]].append("🏆 Top rated")
     for h in hotels:
         if sum(r["left"] for r in h["rooms"]) <= 2:
             tags[h["id"]].append("🔥 Few rooms")
@@ -78,7 +90,7 @@ def hotel_tags(hotels: list[dict]) -> dict[str, list[str]]:
 
 
 def hotel_row(h: dict, tags: list[str] | None = None) -> tuple[str, str, str]:
-    parts = [f"from {inr(h['rooms'][0]['price_inr'])}/night", f"⭐ {h['rating']}", f"{h['stars']}★"] + (tags or [])
+    parts = [f"from {inr(h['rooms'][0]['price_inr'])}/night"] + ([f"⭐ {h['rating']}"] if h.get("rating") else []) + [f"{h['stars']}★"] + (tags or [])
     return f"htl:{h['id']}", h["name"], " · ".join(parts)
 
 
@@ -92,10 +104,10 @@ def stay_countdown(check_in: date | str) -> str:
     d = date.fromisoformat(check_in) if isinstance(check_in, str) else check_in
     days = (d - now_ist().date()).days
     if days <= 0:
-        return "That's *today*, time to pack up and head over! 🧳"
+        return "That's *today*. 🧳"
     if days == 1:
-        return "That's *tomorrow*, start packing! 🧳"
-    return f"That's in *{days} days*, plenty of time to get excited! 🧳"
+        return "That's *tomorrow*. 🧳"
+    return f"That's in *{days} days*. 🧳"
 
 
 def stay_text(b: dict) -> str:
@@ -103,7 +115,11 @@ def stay_text(b: dict) -> str:
     h, r = b["hotels"], b["hotel_rooms"]
     nights = (date.fromisoformat(b["check_out"]) - date.fromisoformat(b["check_in"])).days
     guests = f"👥 {b['guests']} guests" if b["guests"] > 1 else "👤 1 guest"
-    return (f"🎫 Ref: *{b['ref']}*\n{guests} · *{b['guest_name']}*\n━━━━━━━━━━━━━━━\n{hotel_card_short(h)}\n"
+    
+    ref_line = (f"🏷️ Hotel booking no.: *{b['hb_reference']}*" if b.get("hb_reference") 
+                else f"🎫 Internal Booking Ref: *{b['ref']}*")
+
+    return (f"{ref_line}\n{guests} · *{b['guest_name']}*\n━━━━━━━━━━━━━━━\n{hotel_card_short(h)}\n"
             f"🛏️ {r['room_type']} · {r['bed']}\n"
             f"🛎️ Check-in: *{fmt_day(b['check_in'])}* from {CHECK_IN_LABEL}\n"
             f"🚪 Check-out: *{fmt_day(b['check_out'])}* by {CHECK_OUT_LABEL}\n━━━━━━━━━━━━━━━\n"
@@ -111,4 +127,4 @@ def stay_text(b: dict) -> str:
 
 
 def hotel_card_short(h: dict) -> str:
-    return f"🏨 *{h['name']}* · {h['stars']}★\n📍 {h['area']}, {city(h['city_code'])}"
+    return f"🏨 *{h['name']}* · {h['stars']}★\n📍 {where(h)}"

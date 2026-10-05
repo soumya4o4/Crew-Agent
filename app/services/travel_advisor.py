@@ -215,3 +215,65 @@ class TravelAdvisor:
         if tip:
             self._cache[key] = (time.monotonic(), tip)
         return tip or None
+
+    async def evaluate_flight_intent(self, step: str, flight_summary: str, pax_info: str, text: str, language: str = "professional English") -> dict | None:
+        """Evaluates free-form user message during flight search or booking using LLM.
+        Understands confirmation variations ('do this now', 'book now', 'go ahead'), multi-service requests
+        ('plan everything flight hotel cab'), and answers flight-specific questions.
+        """
+        system = (
+            "You are the conversational brain of an AI travel assistant during flight booking on WhatsApp.\n"
+            f"Current step: {step}\n"
+            f"Flight on screen: {flight_summary or 'None'}\n"
+            f"Passenger details: {pax_info or 'None'}\n"
+            f"Language to reply in: {language}\n\n"
+            "Analyze what the user is saying. Return ONLY a JSON object:\n"
+            "{\n"
+            '  "intent": "confirm|cancel|multi_service|flight_question|fastest|cheapest|chit_chat",\n'
+            '  "reply": "natural, warm, helpful response (max 2 sentences)",\n'
+            '  "action": "book|cancel|fastest|cheapest|web_search|none",\n'
+            '  "query": "search query if action is web_search (otherwise empty string)"\n'
+            "}\n"
+            "Classification guidance:\n"
+            "- 'confirm': user wants to proceed / book ('do this now', 'book now', 'go ahead', 'confirm', 'kar do', 'done', 'yes please', 'proceed'). action='book'.\n"
+            "- 'cancel': user wants to abandon or cancel. action='cancel'.\n"
+            "- 'multi_service': user wants to plan/bundle flights with hotels, cabs, or full trip ('plan everything flight and hotel and cab', 'hotel bhi chahiye', 'airport cab').\n"
+            "- 'fastest': user asks for faster/direct flight or shorter duration. action='fastest'.\n"
+            "- 'cheapest': user asks for cheaper flight or budget options. action='cheapest'.\n"
+            "- 'flight_question': user is asking about baggage, layover, timing, meal, airline, or refund. Answer accurately based on the flight details. If you need external facts (like distance to airport, weather, generic policies), use action='web_search' and provide a search 'query'."
+        )
+        try:
+            raw = await self._ask(system, f"User message: {text}", True, 300)
+            return json.loads(raw)
+        except Exception:
+            logger.exception("evaluate_flight_intent failed")
+            return None
+
+    async def evaluate_stay_intent(self, step: str, stay_summary: str, text: str, language: str = "professional English") -> dict | None:
+        """Evaluates free-form user message during hotel search or booking using LLM."""
+        system = (
+            "You are the conversational brain of an AI travel assistant during hotel booking on WhatsApp.\n"
+            f"Current step: {step}\n"
+            f"Hotel on screen: {stay_summary or 'None'}\n"
+            f"Language to reply in: {language}\n\n"
+            "Analyze what the user is saying. Return ONLY a JSON object:\n"
+            "{\n"
+            '  "intent": "confirm|cancel|multi_service|hotel_question|chit_chat",\n'
+            '  "reply": "natural, warm, helpful response (max 2 sentences)",\n'
+            '  "action": "book|cancel|web_search|none",\n'
+            '  "query": "search query if action is web_search (otherwise empty string)"\n'
+            "}\n"
+            "Classification guidance:\n"
+            "- 'confirm': user wants to book/confirm ('book now', 'reserve', 'go ahead', 'kar do'). action='book'.\n"
+            "- 'cancel': user wants to cancel. action='cancel'.\n"
+            "- 'hotel_question': user asks about check-in, amenities, cancellation, food, distance, etc. Answer accurately. If you need external facts (like distance, reviews, location info), use action='web_search' and provide a search 'query'.\n"
+            "- 'multi_service': user wants cab from airport, flight, etc."
+        )
+        try:
+            raw = await self._ask(system, f"User message: {text}", True, 300)
+            return json.loads(raw)
+        except Exception:
+            logger.exception("evaluate_stay_intent failed")
+            return None
+
+

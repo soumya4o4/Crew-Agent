@@ -4,6 +4,7 @@ TripInfo; its `text` goes into the model's prompt as facts."""
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+from app.agents.flight.formatting import baggage_label, pnr_of
 from app.agents.hotel.formatting import CHECK_IN_LABEL, CHECK_OUT_LABEL, free_cancel_until
 from app.core.geo import location_age_min
 from app.core.places import city, is_international
@@ -51,8 +52,8 @@ def _flight_lines(now: datetime, b: dict, route: dict | None) -> list[str]:
     dep, arr = to_ist(f["departure_time"]), to_ist(f["arrival_time"])
     buffer = airport_buffer_min(f)
     lines = [f"Flight {f['flight_no']} {city(f['from_code'])} to {city(f['to_code'])}: departs {dep:%a %d %b %H:%M}, arrives {arr:%H:%M} "
-             f"(status: {f['status']}, {fmt_delta(dep - now)}). PNR {b['pnr']}, {b['passenger_name']}, {f['class']}, "
-             f"{f['baggage_kg']} kg baggage.",
+             f"(status: {f['status']}, {fmt_delta(dep - now)}). PNR {pnr_of(b)}, {b['passenger_name']}, {f['class']}, "
+             f"baggage: {baggage_label(f)}.",
              f"Reach the airport by {dep - timedelta(minutes=buffer):%H:%M} ({buffer // 60}h before, "
              f"{'international' if buffer == 180 else 'domestic'}); check-in counters usually close about an hour before departure."]
     if dep > now and route:
@@ -100,7 +101,7 @@ def _stay_lines(now: datetime, stay: dict, options: list[dict]) -> list[str]:
         lines.append(f"  About: {h['description']}")
     if options:
         picks = "; ".join(
-            f"{o['name']} ({o.get('stars', '?')}-star, {o.get('area', '')}, rated {o.get('rating', '?')}, from "
+            f"{o['name']} ({o.get('stars', '?')}-star, {o.get('area', '')}, rated {o.get('rating') or '?'}, from "
             f"{inr(o['rooms'][0]['price_inr'])}/night" + (f", {', '.join(o['amenities'][:3])}" if o.get("amenities") else "") + ")"
             for o in options)
         lines.append(f"  Other stays free in {city(h.get('city_code', ''))} on the same dates (from our search, suggest only these): {picks}.")

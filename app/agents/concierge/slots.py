@@ -26,7 +26,10 @@ def extract_date(t: str, today: date) -> str | None:
         days = (WEEKDAYS[m.group(1)] - today.weekday()) % 7 or 7
         return (today + timedelta(days=days)).isoformat()
     if re.search(r"\bweekend\b", t):
-        return (today + timedelta(days=(5 - today.weekday()) % 7)).isoformat()
+        saturday = today + timedelta(days=(5 - today.weekday()) % 7)  # this weekend: the coming Saturday (today, if it is one)
+        if re.search(r"\bnext weekend\b", t) and today.weekday() == 5:  # on a Saturday "next weekend" is a week away
+            saturday += timedelta(days=7)
+        return saturday.isoformat()
     return None
 
 

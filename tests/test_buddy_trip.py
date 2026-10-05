@@ -29,7 +29,7 @@ def test_a_question_about_the_booked_flight_stays_with_buddy_and_gets_the_trip_f
     stuck_in_traffic(c, brain)  # the word "flight" must not open the booking flow
     assert len(brain.calls) == 1
     context = brain.calls[0]["context"]
-    for expect in ("Flight 6E-1000 Indore to Mumbai", "PNR ABC123", "Reach the airport by", "User location: not shared"):
+    for expect in ("Flight 6E-1000 Indore to Mumbai", "PNR ZX9Q2K", "Reach the airport by", "User location: not shared"):
         assert expect in context, expect
 
 

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_APP_SECRET: str = ""
     OPENAI_API_KEY: str = ""  # optional: LLM routing via OpenAI (used first if both keys are set)
+    TAVILY_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TRANSCRIBE_MODEL: str = "whisper-1"  # reads the speech in a shared reel
     ANTHROPIC_API_KEY: str = ""  # optional: LLM routing via Claude
@@ -18,6 +19,20 @@ class Settings(BaseSettings):
     RAZORPAY_WEBHOOK_SECRET: str = ""  # set in Razorpay dashboard -> Webhooks; used to verify callbacks
     ADMIN_TOKEN: str = ""  # protects /admin/* (visa team status updates); empty = admin API disabled
     VISA_DEMO_AUTOPROGRESS: bool = False  # demo: move submitted visas to in_review and approved on a timer
+    # Hotelbeds APItude (live hotel availability). Empty keys = the bot uses only the hotels in our own database.
+    HOTELBEDS_API_KEY: str = ""
+    HOTELBEDS_SECRET: str = ""
+    HOTELBEDS_BASE_URL: str = "https://api.test.hotelbeds.com"  # test; production is https://api.hotelbeds.com
+    HOTELBEDS_MARKUP_PCT: float = 0.0  # our margin on top of the net rate Hotelbeds quotes
+    HOTELBEDS_RADIUS_KM: int = 25  # how far from the city centre to look for hotels
+    # Hotelbeds Transfers API
+    HOTELBEDS_TRANSFERS_API_KEY: str = ""
+    HOTELBEDS_TRANSFERS_SECRET: str = ""
+    # Duffel (live flight search and tickets). duffel_test_ tokens use the sandbox, duffel_live_ issues real tickets.
+    DUFFEL_API_TOKEN: str = ""
+    DUFFEL_BASE_URL: str = "https://api.duffel.com"
+    DUFFEL_MARKUP_PCT: float = 0.0  # our margin on top of the fare Duffel quotes
+    DUFFEL_CONTACT_EMAIL: str = ""  # lead-passenger email when the traveller gave none (needed only without online payment)
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 

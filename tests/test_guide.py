@@ -291,12 +291,12 @@ def test_not_knowing_where_to_go_leads_to_ideas_then_a_plan():
     assert "*Bali, Indonesia*" in road["body"] and "6 days" in road["body"] and "visa on arrival" in road["body"]
 
 
-def test_without_an_ai_the_ideas_are_places_we_actually_fly_to():
+def test_without_an_ai_the_ideas_are_airports_we_can_book():
     c = Chat()
     c.send("hi"); c.send(reply_id="svc:guide"); c.send(reply_id="guide:new"); c.send(reply_id="gpass:home"); c.send(reply_id="gkn:no")
     c.send(reply_id="gbud:30000"); c.send(reply_id="gvibe:any"); c.send(reply_id="gdur:4")
     out = c.send(reply_id=c.ids()[1])
-    assert "Mumbai" in out["body"] and c.ids() == ["gdest:0"]
+    assert "Mumbai" in out["body"] and c.ids() == ["gdest:0", "gdest:1", "gdest:2"]
 
 
 def test_the_roadmap_survives_the_main_menu_and_reopens():

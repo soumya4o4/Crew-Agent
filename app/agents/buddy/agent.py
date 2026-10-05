@@ -193,43 +193,62 @@ class BuddyAgent(Agent):
         memories = await self._safe(self.repo.list_memories, s.user["id"]) or []
         history = await self._safe(self.repo.recent_messages, s.user["id"], HISTORY_LIMIT) or []
         trip = await self._trip(s)
+        intermediate_msg = None
         try:
             r = await asyncio.wait_for(self.brain.respond(
                 name=self._first_name(s), today=now_ist().date(), memories=memories, history=history, text=text,
                 trip=s.ctx.get("trip"), context=trip.text, language=language_name(s.ctx)), LLM_TIMEOUT_S)
-        except Exception:
-            logger.exception("Buddy could not answer")
+                
+            if r.action == "web_search" and r.query:
+                intermediate_msg = r.reply  # The natural, non-template message the LLM generated to say 'wait'
+                try:
+                    from app.services.whatsapp_service import WhatsAppService
+                    await WhatsAppService.send(s.phone, text_msg(intermediate_msg))
+                except Exception:
+                    logger.warning("Could not send intermediate wait message")
+                try:
+                    from tavily import TavilyClient
+                    from app.core.config import settings
+                    def _do_search():
+                        if not settings.TAVILY_API_KEY:
+                            raise ValueError("TAVILY_API_KEY is missing")
+                        client = TavilyClient(api_key=settings.TAVILY_API_KEY)
+                        return client.search(r.query, search_depth="basic", max_results=3).get("results", [])
+                    results = await asyncio.to_thread(_do_search)
+                    search_text = "\n".join(f"- {res['title']}: {res.get('content', '')}" for res in results) if results else "No results found."
+                    follow_up = f"System: Web search results for '{r.query}':\n{search_text}\n\nNow, answer my previous message naturally using these facts."
+                    r = await asyncio.wait_for(self.brain.respond(
+                        name=self._first_name(s), today=now_ist().date(), memories=memories, history=history, text=text + "\n\n" + follow_up,
+                        trip=s.ctx.get("trip"), context=trip.text, language=language_name(s.ctx)), LLM_TIMEOUT_S)
+                except Exception as e:
+                    logger.exception(f"Web search failed: {e}")
+                    r_copy_reply = getattr(r, 'reply', None)
+                    natural_fail = (r_copy_reply + "\n\nAek sec bhai, search abhi nahi ho raha. Thodi der mein dobara try karte hain ya Expedia check karo: https://www.expedia.co.in/") if r_copy_reply else "Ek sec bhai, abhi search nahi ho raha. Thodi der mein dobara try karte hain."
+                    return [text_msg(natural_fail)]
+        except Exception as e:
+            logger.exception(f"Buddy could not answer: {e}")
             return [text_msg(FALLBACK)]
+            
         reply = r.reply
         if r.risk != "none":
-            logger.warning("Safety flag %s for user %s", r.risk, s.user["id"])  # no message content in logs
+            logger.warning("Safety flag %s for user %s", r.risk, s.user["id"])
             reply += safety.RISK_NOTES[r.risk]
         if r.remember:
             await self._safe(self.repo.add_memories, s.user["id"], r.remember)
-        if "hotel" in r.suggest and trip.stay and trip.stay.get("hotels"):  # "other stays" opens the hotel search in that city
+        if "hotel" in r.suggest and trip.stay and trip.stay.get("hotels"):
             s.ctx["pending_slots"] = {"to": trip.stay["hotels"]["city_code"], "date": str(trip.stay["check_in"])[:10]}
+            
         out = self._reply_messages(reply, self._buttons(s, r, trip, text))
         return out + self._act(s, r, trip)
 
     @staticmethod
     def _buttons(s: Session, r, trip: T.TripInfo, text: str) -> list[tuple[str, str]]:
-        """The next-step buttons: what the facts say they need (a flight tomorrow, no hotel yet...) first, then whatever the
-        model suggested. Nothing when they are upset, and nothing extra when we are already sending them somewhere."""
-        wanted = [(k, SERVICES[k]) for k in r.suggest if k in SERVICES]
-        if r.risk == "none" and r.action == "none":
-            for k, label in next_needs(now=now_ist(), text=text, flight=trip.flight, stay=trip.stay, trip=s.ctx.get("trip"),
-                                       has_location=bool(trip.loc)):
-                if all(k != w[0] for w in wanted):
-                    wanted.append((k, label))
-        return [(f"svc:{k}", label) for k, label in wanted[:MAX_SUGGEST]]
+        # Keep conversation natural and human-like — no forced buttons during chat
+        return []
 
     @staticmethod
     def _reply_messages(reply: str, buttons: list[tuple[str, str]]) -> list[dict]:
-        if not buttons:
-            return [text_msg(reply)]
-        if len(reply) <= 1000:
-            return [buttons_msg(reply, buttons)]
-        return [text_msg(reply), buttons_msg("Chaho to ye bhi dekh sakte hain 👇", buttons)]
+        return [text_msg(reply)]
 
     def _act(self, s: Session, r, trip: T.TripInfo) -> list[dict]:
         """What the model asked the app to do besides replying."""

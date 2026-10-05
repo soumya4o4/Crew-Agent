@@ -21,7 +21,8 @@ from app.core.utils import day_greeting, normalize_phone, now_ist
 
 logger = logging.getLogger(__name__)
 GREETINGS = {"hi", "hii", "hiii", "hello", "hey", "hlo", "namaste", "start", "hola", "yo"}
-MENU_WORDS = {"menu", "restart", "reset", "home", "cancel"}
+MENU_WORDS = {"menu", "home", "cancel"}
+RESET_WORDS = {"reset", "restart", "reset chat", "restart chat", "start over", "/reset", "/restart"}  # forget everything, start fresh
 HISTORY_LIMIT = 4  # enough for "yes" / "that one"; more makes the model re-queue old requests
 
 
@@ -53,6 +54,8 @@ class Concierge:
         if msg_id and ctx.get("last_msg_id") == msg_id:
             return []  # WhatsApp retried this webhook; already handled
         ctx["last_msg_id"] = msg_id
+        await self._db(self.repo.save_conversation, phone, (convo or {}).get("current_step", "start"), ctx)
+
         if ctx.get("loc") and not fresh_location(ctx):
             ctx.pop("loc")  # a shared location is only kept for a few hours
 
@@ -61,16 +64,34 @@ class Concierge:
         user = await self._db(self.repo.get_or_create_user, phone, profile_name)
         s = Session(phone, user, (convo or {}).get("current_step", "start"), msg_id, ctx)
 
-        if location:
-            out = await self._on_location(s, save_location(s.ctx, **location))
-        elif media:
-            out = await self._on_media(s, media, text.strip())
-        else:
-            out = await self._dispatch(s, text.strip(), reply_id)
-        out = out + await self._follow_up(s)
-        await self._db(self.repo.save_conversation, s.phone, s.step, s.ctx)
-        await self._remember(s, "📍 (shared a location)" if location else text, out)
-        return out
+        try:
+            if location:
+                out = await self._on_location(s, save_location(s.ctx, **location))
+            elif media:
+                out = await self._on_media(s, media, text.strip())
+            else:
+                out = await self._dispatch(s, text.strip(), reply_id)
+            out = out + await self._follow_up(s)
+            await self._db(self.repo.save_conversation, s.phone, s.step, s.ctx)
+            await self._remember(s, "📍 (shared a location)" if location else text, out)
+            return out
+        except Exception as e:
+            import traceback
+            logger.error(
+                f"Exception in concierge flow:\n"
+                f"Conversation/User ID: {phone}\n"
+                f"Current Service: {s.ctx.get('agent', 'None')}\n"
+                f"Current Step: {s.step}\n"
+                f"User Message: {text}\n"
+                f"Tool/API Name: Concierge Dispatch\n"
+                f"Stack Trace:\n{traceback.format_exc()}"
+            )
+            # Never let webhook crash or return 500 — respond gracefully
+            is_h = bool(s and s.ctx.get("hinglish"))
+            msg = ("Ek second bhai, connection mein thoda issue aaya. Ek baar phir bolo, main sun raha hoon."
+                   if is_h else
+                   "One moment, I had a brief connection hiccup. Could you please say that again?")
+            return [text_msg(msg)]
 
     async def _on_location(self, s: Session, loc: dict) -> list[dict]:
         """A shared pin: the agent that asked for it uses it, otherwise we keep it and offer what it can be used for."""
@@ -137,8 +158,11 @@ class Concierge:
             s.ctx["agent"] = agent.name
             return await agent.process(s, text, reply_id)
 
-        low = text.lower()
-        if low in GREETINGS or low in MENU_WORDS:
+        low = text.lower().strip(" .!")
+        if low in RESET_WORDS:
+            return await self._reset(s)
+        # Greetings always reset to a clean slate — never replay the last agent
+        if low in MENU_WORDS or low in GREETINGS:
             return self._main_menu(s, greet=True)
         if is_crisis(text):  # before anything else, and independent of the LLM
             return self._crisis(s)
@@ -147,17 +171,49 @@ class Concierge:
                 s.ctx["agent"] = agent.name
                 return await agent.process(s, text, None)
 
-        active = self.agents.get(s.ctx.get("agent"))
-        if active and active.expects_text(s):  # mid-question ("which date?"): the active agent gets the answer...
-            other = self.router.keywords.classify(text, now_ist().date())
-            if active.keeps_text(text, other, set(self.agents)):
-                return await active.process(s, text, None)
-            return await self._apply(s, other, text)  # ...unless they clearly switched topic ("actually, a hotel")
+        # Always fetch history for LLM — gives full context for intent re-evaluation
+        history = await self._history(s) if self.router.uses_llm else []
+        active_trip = s.ctx.get("trip") or {}
+        if not active_trip and (s.ctx.get("from") or s.ctx.get("to")):
+            active_trip = {
+                "from": s.ctx.get("from"),
+                "to": s.ctx.get("to"),
+                "city": city(s.ctx.get("to")) if s.ctx.get("to") else "",
+                "date": s.ctx.get("date"),
+                "summary": s.ctx.get("flight_summary"),
+                "names": s.ctx.get("names")
+            }
+        intent = await self.router.classify(text, history, s.ctx.get("agent"), active_trip)
 
-        # Chat history only helps mid-conversation ("yes", "there"). From the menu it just drags old requests along.
-        history = await self._history(s) if self.router.uses_llm and active else []
-        intent = await self.router.classify(text, history, active.name if active else None, s.ctx.get("trip"))
+        active = self.agents.get(s.ctx.get("agent"))
+
+        # Mid-question state (e.g. waiting for a date or confirmation):
+        if active and active.expects_text(s):
+            # If user is in flight confirmation, let flight's LLM assistant handle natural confirmation / questions
+            if active.name == "flight" and s.ctx.get("flight_id") and s.step in ("awaiting_confirm", "awaiting_flight_action"):
+                out = await active.process(s, text, None)
+                if out:
+                    return out
+
+            is_followup = (intent.name == active.name or intent.name in ("smalltalk", "unknown"))
+            if is_followup and active.keeps_text(text, intent, set(self.agents)):
+                out = await active.process(s, text, None)
+                # AI Fallback: if agent returned a confusion message, hand to LLM/buddy
+                if self.router.uses_llm and out and str(out[0].get("body", "")).startswith("😕 "):
+                    if intent.name != active.name or intent.slots.get("unknown_to"):
+                        return await self._apply(s, intent, text)
+                return out
+            # Clear topic switch detected — route to new intent
+            return await self._apply(s, intent, text)
+
         return await self._apply(s, intent, text)
+
+    async def _reset(self, s: Session) -> list[dict]:
+        """"reset": forget the whole conversation (trip, search, cart, answers so far) and start fresh. A payment still
+        waiting is released; anything already paid stays booked."""
+        await self.checkout.abandon(s)
+        s.ctx.clear()
+        return [text_msg("🔄 Chat reset, we're starting fresh!")] + self._main_menu(s, greet=True)
 
     def _crisis(self, s: Session) -> list[dict]:
         """Self-harm talk: a caring message with helplines. If Buddy exists the chat carries on with it."""
@@ -189,48 +245,41 @@ class Concierge:
             s.ctx["queue"], s.ctx["agent"] = [], "buddy"
             return await self.agents["buddy"].process(s, text, None)
 
-        if (place := intent.slots.get("unknown_to")) and "flight" in self.agents \
-                and intent.name not in ("bookings", "help", "nearby", "visa", "forex"):
-            s.ctx["queue"], s.ctx["agent"] = [], "flight"
-            return await self.agents["flight"].trip_idea(s, place)
+        if place := intent.slots.get("unknown_to"):
+            if intent.name == "hotel" and "buddy" in self.agents:
+                s.ctx["queue"], s.ctx["agent"] = [], "buddy"
+                return await self.agents["buddy"].process(s, f"{text}\n\n(System: I cannot book stays in {place} yet. Please do a web search for hotels there and give the user some suggestions.)", None)
+            if "flight" in self.agents and intent.name not in ("bookings", "help", "nearby", "visa", "forex", "hotel"):
+                s.ctx["queue"], s.ctx["agent"] = [], "flight"
+                return await self.agents["flight"].trip_idea(s, place)
 
-        # Only queue extra services the user actually named: a model guessing "hotel" after "show me flights" is unwanted.
-        # What comes next is offered after the booking is paid.
         also = [n for n in intent.also if not text or re.search(PATTERNS.get(n, "(?!x)x"), text.lower())]
         wanted = [n for n in dict.fromkeys([intent.name, *also]) if n in self.agents]
         if wanted:
-            wanted.sort(key=lambda n: not self._is_live(n))  # stable: what we can actually do now goes first
+            wanted.sort(key=lambda n: not self._is_live(n))
             first, rest = wanted[0], wanted[1:]
             s.ctx["queue"], s.ctx["agent"] = rest, first
-            out = await self.agents[first].start(s, {**intent.slots, "text": text} if text else intent.slots)
-            if rest:
-                later = " and ".join(self.agents[n].title.lower() for n in rest)
-                out.insert(0, text_msg(f"Got it! Let's start with {self.agents[first].title.lower()}, "
-                                       f"then I'll help with {later}. 👍"))
-            return out
+            return await self.agents[first].start(s, {**intent.slots, "text": text} if text else intent.slots)
         return self._clarify(s, intent)
 
     @staticmethod
     def _is_personal(intent: Intent) -> bool:
-        """Talk that isn't a service request: feelings, advice, chit-chat. A vague trip idea ("I want to go to Goa")
-        still gets the service options instead."""
-        return intent.name == "buddy" or (intent.name in ("smalltalk", "unknown") and not intent.options
-                                          and not intent.slots.get("to"))
+        """Talk that isn't a service request: feelings, advice, chit-chat.
+        Any vague or unknown query is sent to Buddy so the LLM can handle it naturally."""
+        return intent.name in ("buddy", "smalltalk", "unknown")
 
     def _clarify(self, s: Session, intent: Intent) -> list[dict]:
-        """Request too vague to act on: offer the most useful next steps instead of a generic menu."""
-        options = [o for o in intent.options if o in self.agents][:3]
+        """Request too vague to act on: respond naturally as text without forcing buttons."""
         question = intent.question or intent.reply
-        if not options and intent.slots.get("to"):  # they named a place but not what they need
-            options = ["flight", "hotel", "planner"]
-            question = f"Nice, *{city(intent.slots['to'])}*! 😍 What do you need?"
-        if not options:
-            return self._main_menu(s, note=intent.reply or "I can help with flights today, and hotels, cabs, trip "
-                                                           "planning, events, visa & forex soon. What do you need? 👇")
-        s.step = "menu"
-        s.ctx["pending_slots"] = intent.slots  # carried into whichever option they tap
-        buttons = [(f"svc:{o}", f"{self.agents[o].emoji} {self.agents[o].title}") for o in options]
-        return [buttons_msg(question or "What would you like help with? 👇", buttons)]
+        if intent.slots.get("to"):
+            dest = city(intent.slots["to"])
+            return [text_msg(question or f"What would you like help with for {dest} — flights, hotels, or a full trip plan?")]
+
+        if "buddy" in self.agents and question:
+            s.ctx["agent"] = "buddy"
+            return [text_msg(question)]
+
+        return [text_msg(question or "How can I help you today — flights, hotels, cabs, or planning a trip?")]
 
     async def _enter(self, s: Session, name: str) -> list[dict]:
         agent = self.agents.get(name)
@@ -248,13 +297,12 @@ class Concierge:
             s.ctx.pop(key, None)
         for agent in self.agents.values():
             agent.reset(s)
-        if greet:  # two short texts, no menu to scroll: the traveller just says what they need
+        if greet:
             first = (s.user.get("name") or "").split(" ")[0]
-            first = first if first and first != "Unknown" else "there"
-            return [text_msg(f"{day_greeting()}, {first}! 👋 I'll help you with your complete trip planning: flights, hotels, "
-                             "cabs and everything else you need, all in this chat."),
-                    text_msg(f"Let me know what you'd like to do. Just type it, like *{example_route()}, 12 Oct, round trip*. ✈️")]
-        body = note or "What do you need next? 👇"
+            first = first if first and first != "Unknown" else ""
+            greeting = f"{day_greeting()}, {first}! " if first else f"{day_greeting()}! "
+            return [text_msg(f"{greeting}How can I help you today — flights, hotels, trip planning, or something else?")]
+        body = note or "What would you like help with?"
         rows = [(f"svc:{a.name}", f"{a.emoji} {a.title}", a.menu_desc) for a in self.agents.values() if a.in_menu]
         rows.append(("menu:bookings", "📋 My Bookings", "Your flights & trips"))
         return [list_msg(body, "Choose service", rows, "Services")]

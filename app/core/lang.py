@@ -32,7 +32,7 @@ def update_language(ctx: dict, text: str) -> None:
         return
     if any(w in HINGLISH for w in words):
         ctx["hinglish"] = True
-    elif len(words) >= 3:
+    elif len(words) >= 2:  # even a 2-word English sentence resets to English
         ctx["hinglish"] = False
 
 
@@ -40,6 +40,6 @@ def language_name(ctx: dict) -> str:
     pref = ctx.get("lang_pref")
     if pref == "hindi_script":
         return "Hindi in Devanagari script"
-    if pref == "english" or (not pref and not ctx.get("hinglish")):
-        return "English"
-    return "Hinglish (Hindi and English mixed, Roman script)"
+    if pref == "hinglish" or (not pref and ctx.get("hinglish")):
+        return "Hinglish (Hindi and English mixed, Roman script)"
+    return "professional English"  # default: clear, natural, professional English
