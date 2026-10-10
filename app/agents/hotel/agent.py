@@ -537,10 +537,6 @@ class HotelAgent(Agent):
             shown = hotels[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
             extra = f" (showing {page * PAGE_SIZE + 1}-{page * PAGE_SIZE + len(shown)})"
             more = [("hact:more", f"➡️ More ({page + 1}/{pages})", "See the next stays")]
-            if page == 0:  # everything at a glance, then the list to pick from
-                out.append(text_msg(f"🏨 *All {len(hotels)} stays in {city(h['city'])}* (cheapest first)\n" + "\n".join(
-                    f"{i}. {x['name']} · {x['stars']}★ · {rating_text(x)}from {inr(x['rooms'][0]['price_inr'])}"
-                    for i, x in enumerate(hotels, 1))))
         rows = [hotel_row(x, tags[x["id"]]) for x in shown] + more + [("nav:menu", "🏠 Main menu", "")]
         return out + [list_msg(
             f"🏨 *{city(h['city'])}* · {fmt_day(check_in)} ➜ {fmt_day(check_out)} ({plural(h['nights'], 'night')}, "

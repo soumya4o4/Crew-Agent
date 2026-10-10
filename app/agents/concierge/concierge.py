@@ -200,8 +200,9 @@ class Concierge:
                 out = await active.process(s, text, None)
                 # AI Fallback: if agent returned a confusion message, hand to LLM/buddy
                 if self.router.uses_llm and out and str(out[0].get("body", "")).startswith("😕 "):
-                    if intent.name != active.name or intent.slots.get("unknown_to"):
-                        return await self._apply(s, intent, text)
+                    if intent.name == active.name:
+                        intent.name = "buddy"
+                    return await self._apply(s, intent, text)
                 return out
             # Clear topic switch detected — route to new intent
             return await self._apply(s, intent, text)
@@ -259,7 +260,14 @@ class Concierge:
             wanted.sort(key=lambda n: not self._is_live(n))
             first, rest = wanted[0], wanted[1:]
             s.ctx["queue"], s.ctx["agent"] = rest, first
-            return await self.agents[first].start(s, {**intent.slots, "text": text} if text else intent.slots)
+            out = await self.agents[first].start(s, {**intent.slots, "text": text} if text else intent.slots)
+            if rest and out and first != "guide":
+                titles = [self.agents[n].title.lower() for n in rest]
+                others = f"{', '.join(titles[:-1])} and {titles[-1]}" if len(titles) > 1 else titles[0]
+                is_h = bool(s.ctx.get("hinglish"))
+                msg = f"Done! Hum ek-ek karke plan karte hain. Pehle {self.agents[first].title.lower()} dekhte hain, phir {others} plan karenge." if is_h else f"Got it! Let's take it one step at a time. We'll start with your {self.agents[first].title.lower()}, and then look at the {others}."
+                out = [text_msg(msg)] + out
+            return out
         return self._clarify(s, intent)
 
     @staticmethod

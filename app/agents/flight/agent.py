@@ -231,11 +231,13 @@ class FlightAgent(Agent):
 
         if action == "fastest":
             c["sort"] = "fast"
-            return await self._show_results(s)
+            out = await self._show_results(s)
+            return [text_msg(reply)] + out if reply else out
 
         if action == "cheapest":
             c["sort"] = "cheap"
-            return await self._show_results(s)
+            out = await self._show_results(s)
+            return [text_msg(reply)] + out if reply else out
 
         if intent == "multi_service":
             trip = c.setdefault("trip", {})
